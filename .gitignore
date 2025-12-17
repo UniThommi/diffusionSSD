@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+checkpoints/
+*.pt
+*.pth
+*.h5
+.env
+*.hdf5

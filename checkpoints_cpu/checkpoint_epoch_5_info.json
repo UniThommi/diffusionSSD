@@ -1,0 +1,24 @@
+{
+  "epoch": 5,
+  "loss": 1.0093050003051758,
+  "config": {
+    "phi_dim": 22,
+    "target_dim": 7789,
+    "T": 1000,
+    "hidden_dim": 512,
+    "n_layers": 4,
+    "t_emb_dim": 32,
+    "batch_size": 32,
+    "learning_rate": 0.0001,
+    "epochs": 5,
+    "steps_per_epoch": 50,
+    "gradient_clip_norm": 1.0,
+    "use_ema": false,
+    "ema_decay": 0.999,
+    "checkpoint_dir": "./checkpoints_cpu",
+    "log_dir": "./logs_cpu",
+    "save_every_n_epochs": 2,
+    "eval_every_n_epochs": 5
+  },
+  "timestamp": "2025-09-18T00:37:43.073937"
+}
