@@ -17,8 +17,8 @@ tf.config.threading.set_intra_op_parallelism_threads(4)
 import time
 import numpy as np
 from datetime import datetime
-from data_loader import voxelDataset
-from diffusion_model import build_diffusion_model
+from data.data_loader import voxelDataset
+from models.diffusion_model import build_diffusion_model
 
 
 class DiffusionTrainer:

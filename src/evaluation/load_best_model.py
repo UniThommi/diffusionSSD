@@ -21,7 +21,7 @@ import tensorflow as tf
 import json
 from pathlib import Path
 from typing import Tuple, Dict, Optional
-from diffusion_model import build_diffusion_model
+from models.diffusion_model import build_diffusion_model
 
 
 def load_best_model(checkpoint_dir: str = "./checkpoints_cpu") -> Tuple[tf.keras.Model, Dict]:

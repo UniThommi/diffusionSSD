@@ -35,7 +35,7 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from scipy import stats
 from scipy.signal import correlate
-from diffusion_model import build_diffusion_model
+from models.diffusion_model import build_diffusion_model
 
 
 @dataclass

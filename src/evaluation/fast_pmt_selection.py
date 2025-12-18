@@ -24,7 +24,7 @@ import json
 import os
 from typing import List, Tuple, Dict
 from dataclasses import dataclass
-from diffusion_model import build_diffusion_model
+from models.diffusion_model import build_diffusion_model
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
