@@ -379,130 +379,63 @@ class EmpiricalHitRateAnalyzer:
         return max_correlation
 
 
-class FastPMTSelector:
+class PMTSelector:
     """
-    Kombiniert multiple schnelle Methoden für robuste PMT-Selektion
+    Attention-based PMT selection with multiplicity constraint
+    
+    Reference: Vishwasrao et al. (2025) - Diff-SPORT
     """
     
-    def __init__(self, model: tf.keras.Model, config: FastSelectionConfig):
-        self.model = model
-        self.config = config
-        
-        # Initialisiere Calculators
-        self.gradient_calc = GradientImportanceCalculator(model, config)
-        self.reconstruction_calc = ReconstructionImportanceCalculator(model, config)
-        self.empirical_calc = EmpiricalHitRateAnalyzer(config)
-    
-    def compute_combined_importance(self, test_data: List[Dict]) -> Dict[str, np.ndarray]:
+    def select_pmts_with_multiplicity_constraint(self, 
+                                                  model, 
+                                                  test_data,
+                                                  n_pmts=300,
+                                                  multiplicity_threshold=6,
+                                                  hit_threshold=0.5):
         """
-        Berechne Importance-Scores mit allen aktivierten Methoden
+        Greedy PMT selection ensuring multiplicity constraint
         
-        Returns:
-            Dict mit individual scores und combined score
+        Strategy:
+        1. Compute importance scores (attention/Shapley)
+        2. Select PMTs greedily
+        3. At each step, verify multiplicity condition
+        4. Stop when both criteria met:
+           - N = 300 PMTs selected
+           - Detection rate > 90% (multiplicity ≥ 6)
         """
-        scores = {}
         
-        # Methode 1: Gradient-basiert
-        if self.config.use_gradient_importance:
-            print("\n[1/3] Gradient-basierte Importance...")
-            scores['gradient'] = self.gradient_calc.compute_importance_scores(test_data)
-            print(f"  ✓ Mean: {np.mean(scores['gradient']):.6f}")
+        # Compute attention scores (importance)
+        importance_scores = self._compute_attention_scores(model, test_data)
         
-        # Methode 2: Reconstruction-basiert
-        if self.config.use_reconstruction_importance:
-            print("\n[2/3] Reconstruction-basierte Importance...")
-            scores['reconstruction'] = self.reconstruction_calc.compute_ablation_importance(
-                test_data, sample_size=self.config.n_ablation_voxels
-            )
-            print(f"  ✓ Mean: {np.mean(scores['reconstruction']):.6f}")
+        # Sort PMTs by importance
+        sorted_pmts = np.argsort(importance_scores)[::-1]
         
-        # Methode 3: Empirische Hit-Rate
-        if self.config.use_empirical_hitrate:
-            print("\n[3/3] Empirische Hit-Rate Analyse...")
-            scores['hitrate'] = self.empirical_calc.compute_hitrate_scores(test_data)
-            scores['correlation'] = self.empirical_calc.compute_correlation_scores(test_data)
-            print(f"  ✓ Hit-Rate Mean: {np.mean(scores['hitrate']):.6f}")
-            print(f"  ✓ Correlation Mean: {np.mean(scores['correlation']):.6f}")
-        
-        # Kombiniere Scores (Ensemble)
-        print("\nKombiniere Importance-Scores...")
-        all_scores = []
-        weights = []
-        
-        if 'gradient' in scores:
-            all_scores.append(scores['gradient'])
-            weights.append(0.25)
-        
-        if 'reconstruction' in scores:
-            all_scores.append(scores['reconstruction'])
-            weights.append(0.25)
-        
-        if 'hitrate' in scores:
-            all_scores.append(scores['hitrate'])
-            weights.append(0.3)
-        
-        if 'correlation' in scores:
-            all_scores.append(scores['correlation'])
-            weights.append(0.2)
-        
-        # Normalisiere jeden Score auf [0, 1]
-        normalized_scores = []
-        for score in all_scores:
-            score_min = np.min(score)
-            score_max = np.max(score)
-            score_norm = (score - score_min) / (score_max - score_min + 1e-8)
-            normalized_scores.append(score_norm)
-        
-        # Weighted Average
-        combined = np.average(normalized_scores, axis=0, weights=weights)
-        scores['combined'] = combined
-        
-        return scores
-    
-    def select_pmts_with_multiplicity(self,
-                                     importance_scores: np.ndarray,
-                                     test_data: List[Dict]) -> Tuple[np.ndarray, Dict]:
-        """
-        Greedy-Selektion unter Multiplizitäts-Constraint
-        """
-        n_to_select = self.config.n_pmts_to_select
-        sorted_indices = np.argsort(importance_scores)[::-1]
-        
-        selected = []
+        selected_pmts = []
         detection_rates = []
         
-        print(f"\nGreedy PMT-Selektion (Ziel: {n_to_select})...")
-        
-        for i, pmt_idx in enumerate(sorted_indices):
-            selected.append(pmt_idx)
+        for pmt_idx in sorted_pmts:
+            selected_pmts.append(pmt_idx)
             
-            # Compute detection rate
+            # Test detection rate with current PMT set
             n_detected = 0
             for event in test_data:
-                active_pmts = np.sum(
-                    event['signal'][selected] > self.config.hit_threshold
-                )
-                if active_pmts >= self.config.multiplicity_threshold:
+                # Simulate detection: count active PMTs
+                signal = event['signal']
+                active_pmts = np.sum(signal[selected_pmts] > hit_threshold)
+                
+                if active_pmts >= multiplicity_threshold:
                     n_detected += 1
             
             detection_rate = n_detected / len(test_data)
             detection_rates.append(detection_rate)
             
-            if (i + 1) % 50 == 0 or (i + 1) == n_to_select:
-                print(f"  {i+1} PMTs: Detection = {detection_rate:.3f}, "
-                      f"Importance = {importance_scores[pmt_idx]:.6f}")
-            
-            if len(selected) >= n_to_select:
+            # Check stopping criteria
+            if len(selected_pmts) >= n_pmts and detection_rate > 0.9:
+                print(f"✓ Found optimal set: {len(selected_pmts)} PMTs, "
+                      f"Detection rate: {detection_rate:.3f}")
                 break
         
-        stats = {
-            'n_selected': len(selected),
-            'final_detection_rate': detection_rates[-1],
-            'mean_importance': np.mean(importance_scores[selected]),
-            'detection_rate_curve': detection_rates
-        }
-        
-        return np.array(selected), stats
+        return np.array(selected_pmts), detection_rates
 
 
 def load_test_data(data_path: str, n_events: int = 500) -> List[Dict]:

@@ -6,3 +6,8 @@ checkpoints_cpu/
 *.h5
 .env
 *.hdf5
+*.json
+*.txt
+src/optuna*
+*.png
+src/training_logs
