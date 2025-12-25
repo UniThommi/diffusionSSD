@@ -1,11 +1,12 @@
-import tensorflow as tf
 import os
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices=false'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-def build_diffusion_model(phi_dim=22, target_dim=9583, T=1000, 
+import tensorflow as tf
+
+def build_diffusion_model(phi_dim=22, target_dim=7789, T=1000, 
                          t_emb_dim=64, hidden_dim=512, n_layers=4,
                          use_residual=True, use_attention=False):
     """

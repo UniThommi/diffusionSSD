@@ -36,6 +36,7 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass, asdict
 from data.data_loader import voxelDataset
 from models.diffusion_model import build_diffusion_model
+from tensorflow.keras.optimizers.schedules import CosineDecay
 
 
 @dataclass
@@ -302,6 +303,13 @@ class OptimizedTrainer:
     
     def __init__(self, config: Dict, experiment_name: str = None):
         self.config = config
+    
+        # Nutze Config-Experiment-Name falls vorhanden
+        if experiment_name is None:
+            experiment_name = config.get('experiment_name', 
+                                        f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        
+        self.logger = TrainingLogger(config['log_dir'], experiment_name)
         
         if experiment_name is None:
             experiment_name = f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -325,7 +333,7 @@ class OptimizedTrainer:
         full_dataset = loader.get_noisy_dataset(
             batch_size=config['batch_size'],
             shuffle=True,
-            buffer_size=1000
+            buffer_size=10000
         )
         
         self.train_dataset = full_dataset.take(n_train_batches)
@@ -349,57 +357,183 @@ class OptimizedTrainer:
         
         # Model info
         total_params = self.model.count_params()
-        model_size_mb = total_params * 4 / (1024 ** 2)  # Float32 = 4 bytes
-        
+        model_size_mb = total_params * 4 / (1024 ** 2)
+
         self.logger.log(f"  Parameters: {total_params:,}")
         self.logger.log(f"  Model Size: {model_size_mb:.2f} MB")
-        
-        # Optimizer
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=config['learning_rate'])
+
+        # Loss function
         self.loss_fn = tf.keras.losses.MeanSquaredError()
+
+        # ===== OPTIMIZER MIT LR SCHEDULE =====
+        if config.get('use_lr_schedule', False):
+            self.logger.log("\n✓ Using Cosine Annealing LR Schedule")
+            total_steps = config['epochs'] * config['steps_per_epoch']
+            
+            lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+                initial_learning_rate=config['learning_rate'],
+                decay_steps=total_steps,
+                alpha=1e-6
+            )
+            self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+        else:
+            self.logger.log("\n✓ Using constant learning rate")
+            self.optimizer = tf.keras.optimizers.Adam(learning_rate=config['learning_rate'])
+
+        # ===== EMA INITIALISIERUNG =====
+        if config.get('use_ema', False):
+            self.logger.log("✓ Initializing EMA model")
+            self.ema_model = tf.keras.models.clone_model(self.model)
+            self.ema_model.set_weights(self.model.get_weights())
+            self.ema_decay = config.get('ema_decay', 0.9999)
+        else:
+            self.ema_model = None
+
+        # Diffusion schedule (für Physics Loss)
+        betas = tf.linspace(1e-4, 0.02, config['T'])
+        self.alphas = 1.0 - betas
+        self.alphas_cumprod = tf.math.cumprod(self.alphas)
+
+    def compute_physics_loss(self, x_pred, x_true, phi, weight=0.1):
+        """
+        Material-bewusster Physics Loss
         
-        # Fast Validation
-        self.fast_validator = FastValidation(self.model, self.loss_fn, config)
+        Prüft:
+        1. Energieerhaltung PRO MATERIAL
+        2. Multiplizität (N≥6 Voxel aktiv)
         
-        # Training state
-        self.best_val_loss = float('inf')
-        self.patience_counter = 0
-        self.current_epoch = 0
+        Args:
+            x_pred: Predicted signal (batch, 7789)
+            x_true: True signal (batch, 7789)
+            phi: NC parameters (batch, 22)
+            weight: Gewichtung des Physics Loss
+        """
+        batch_size = tf.shape(x_pred)[0]
+        
+        # Extrahiere Material-IDs (phi[:, 18] = matID)
+        mat_ids = phi[:, 18]
+        
+        # Extrahiere Energien (phi[:, 1] = E_gamma_tot_keV)
+        energies = phi[:, 1]
+        
+        # 1. ENERGIEERHALTUNG PRO MATERIAL
+        signal_sum_pred = tf.reduce_sum(x_pred, axis=1)  # (batch,)
+        signal_sum_true = tf.reduce_sum(x_true, axis=1)  # (batch,)
+        
+        # Relative Abweichung (nur wenn signal_sum_true > 0)
+        safe_denom = tf.maximum(signal_sum_true, 1e-6)
+        energy_violation = tf.abs(signal_sum_pred - signal_sum_true) / safe_denom
+        
+        # Gewichte nach Material (höhere Strafen für gut bekannte Materialien)
+        # matID: 0=Water, 1=LAr, 2=Steel, 3=Copper
+        material_weights = tf.where(
+            tf.equal(mat_ids, 1.0),  # LAr (Hauptdetektor)
+            tf.constant(2.0, dtype=tf.float32),  # Höhere Gewichtung
+            tf.constant(1.0, dtype=tf.float32)   # Normale Gewichtung
+        )
+        
+        energy_loss = tf.reduce_mean(energy_violation * material_weights)
+        
+        # 2. MULTIPLIZITÄTS-CONSTRAINT (N≥6 Voxel)
+        threshold = 0.5
+        active_pred = tf.cast(x_pred > threshold, tf.float32)
+        active_true = tf.cast(x_true > threshold, tf.float32)
+        
+        mult_pred = tf.reduce_sum(active_pred, axis=1)  # (batch,)
+        mult_true = tf.reduce_sum(active_true, axis=1)  # (batch,)
+        
+        # Loss: Abweichung von N=6 Constraint
+        mult_loss = tf.reduce_mean(tf.abs(mult_pred - mult_true))
+        
+        # 3. KOMBINIERTER PHYSICS LOSS
+        total_physics = 0.6 * energy_loss + 0.4 * mult_loss
+        
+        return weight * total_physics, energy_loss, mult_loss
+            
     
     @tf.function(reduce_retracing=True)
     def train_step(self, batch):
-        """Optimized training step"""
+        """Optimized training step mit Physics Loss"""
         phi_b, x_noisy_b, noise_b, t_b = batch
         
         with tf.GradientTape() as tape:
+            # Noise prediction
             predictions = self.model([x_noisy_b, phi_b, t_b], training=True)
-            loss = self.loss_fn(noise_b, predictions)
+            
+            # Diffusion Loss (MSE)
+            diffusion_loss = self.loss_fn(noise_b, predictions)
+            
+            # Physics Loss (nur wenn aktiviert)
+            if self.config.get('use_physics_loss', False):
+                # Approximate x_0 von x_noisy
+                alpha_t = tf.gather(self.alphas_cumprod, t_b)
+                sqrt_alpha = tf.sqrt(alpha_t)
+                sqrt_one_minus = tf.sqrt(1.0 - alpha_t)
+                
+                # x_0 ≈ (x_noisy - sqrt(1-α)*ε) / sqrt(α)
+                x_pred = (x_noisy_b - sqrt_one_minus[:, None] * predictions) / (sqrt_alpha[:, None] + 1e-8)
+                x_true = (x_noisy_b - sqrt_one_minus[:, None] * noise_b) / (sqrt_alpha[:, None] + 1e-8)
+                
+                physics_loss, energy_loss, mult_loss = self.compute_physics_loss(
+                    x_pred, x_true, phi_b, weight=self.config.get('physics_loss_weight', 0.1)
+                )
+                
+                total_loss = diffusion_loss + physics_loss
+            else:
+                physics_loss = tf.constant(0.0)
+                energy_loss = tf.constant(0.0)
+                mult_loss = tf.constant(0.0)
+                total_loss = diffusion_loss
         
-        gradients = tape.gradient(loss, self.model.trainable_variables)
+        # Gradients
+        gradients = tape.gradient(total_loss, self.model.trainable_variables)
         
         # Gradient clipping
-        gradients, _ = tf.clip_by_global_norm(gradients, self.config['gradient_clip_norm'])
+        if self.config.get('gradient_clip_norm', None):
+            gradients, _ = tf.clip_by_global_norm(gradients, self.config['gradient_clip_norm'])
         
+        # Apply
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         
-        return loss
+        # EMA Update (nach jedem Step!)
+        if self.ema_model is not None:
+            for ema_var, model_var in zip(self.ema_model.trainable_variables, 
+                                        self.model.trainable_variables):
+                ema_var.assign(self.ema_decay * ema_var + (1 - self.ema_decay) * model_var)
+        
+        return total_loss, diffusion_loss, physics_loss
     
     def train_epoch(self):
-        """Train one epoch"""
+        """Train one epoch mit Physics Loss Tracking"""
         epoch_start = time.time()
         
         losses = []
+        diffusion_losses = []
+        physics_losses = []
         n_samples = 0
         
         for step, batch in enumerate(self.train_dataset.take(self.config['steps_per_epoch'])):
-            loss = self.train_step(batch)
-            losses.append(loss.numpy())
+            total_loss, diff_loss, phys_loss = self.train_step(batch)
+            
+            losses.append(total_loss.numpy())
+            diffusion_losses.append(diff_loss.numpy())
+            physics_losses.append(phys_loss.numpy())
             
             n_samples += self.config['batch_size']
             
             if (step + 1) % 10 == 0:
-                self.logger.log(f"  Step {step+1}/{self.config['steps_per_epoch']}: "
-                              f"Loss={loss.numpy():.6f}")
+                if self.config.get('use_physics_loss', False):
+                    self.logger.log(
+                        f"  Step {step+1}/{self.config['steps_per_epoch']}: "
+                        f"Total={total_loss.numpy():.6f}, "
+                        f"Diff={diff_loss.numpy():.6f}, "
+                        f"Phys={phys_loss.numpy():.6f}"
+                    )
+                else:
+                    self.logger.log(
+                        f"  Step {step+1}/{self.config['steps_per_epoch']}: "
+                        f"Loss={total_loss.numpy():.6f}"
+                    )
         
         epoch_time = time.time() - epoch_start
         avg_loss = np.mean(losses)
@@ -408,9 +542,34 @@ class OptimizedTrainer:
         return avg_loss, epoch_time, throughput
     
     def validate(self):
-        """Fast validation"""
-        # Nutze nur 20 Batches für Geschwindigkeit
-        val_loss = self.fast_validator.validate(self.val_dataset, n_batches=20)
+        """Fast validation mit Variance-Check"""
+        # Normale Validation
+        if self.ema_model is not None:
+            original_model = self.fast_validator.model
+            self.fast_validator.model = self.ema_model
+            val_loss = self.fast_validator.validate(self.val_dataset, n_batches=20)
+            self.fast_validator.model = original_model
+        else:
+            val_loss = self.fast_validator.validate(self.val_dataset, n_batches=20)
+        
+        # HYPOTHESE 1 TEST: Prüfe ob Model nur Durchschnitt lernt
+        if self.current_epoch % 5 == 0:  # Alle 5 Epochs
+            self.logger.log("\n  [Variance Check]")
+            pred_vars = []
+            for batch in self.val_dataset.take(10):
+                phi_b, x_noisy_b, _, t_b = batch
+                model_to_use = self.ema_model if self.ema_model else self.model
+                preds = model_to_use([x_noisy_b, phi_b, t_b], training=False)
+                pred_vars.append(float(tf.math.reduce_variance(preds).numpy()))
+            
+            avg_var = np.mean(pred_vars)
+            self.logger.log(f"  Prediction Variance: {avg_var:.6f}")
+            
+            if avg_var < 0.01:
+                self.logger.log("  ⚠️ WARNING: Model may be predicting constant values!")
+            else:
+                self.logger.log("  ✓ Model predictions vary (learning)")
+        
         return val_loss
     
     def train(self):
@@ -501,24 +660,35 @@ def main():
         't_emb_dim': 64,
         
         # Training Parameters
-        'batch_size': 32,
-        'learning_rate': 5e-5,
-        'epochs': 20,
-        'steps_per_epoch': 200,
+        'batch_size': 64,          # VERDOPPELT von 32 → mehr Effizienz
+        'learning_rate': 1e-4,     # ERHÖHT von 5e-5 → schnellere Konvergenz
+        'epochs': 30,
+        'steps_per_epoch': 250,    # ERHÖHT von 200 → mehr Daten pro Epoch
         'gradient_clip_norm': 1.0,
         'patience': 5,
         
+        # Optimizations (NEU!)
+        'use_lr_schedule': True,           # Cosine Annealing
+        'use_ema': True,                   # Exponential Moving Average
+        'ema_decay': 0.9999,
+        'use_physics_loss': True,          # Material-aware Physics
+        'physics_loss_weight': 0.3,        # 10% Gewichtung
+        
         # Paths
         'checkpoint_dir': './checkpoints_cpu',
-        'log_dir': './training_logs'
+        'log_dir': './training_logs',
+        'experiment_name': 'optimized_training_v2',
     }
+
+    # LR Schedule:
+    total_steps = config['epochs'] * config['steps_per_epoch']
     
     # Create directories
     Path(config['checkpoint_dir']).mkdir(exist_ok=True)
     Path(config['log_dir']).mkdir(exist_ok=True)
     
     # Train
-    trainer = OptimizedTrainer(config, experiment_name="optimized_training_v1")
+    trainer = OptimizedTrainer(config)
     model = trainer.train()
     
     print("\n✓ Training abgeschlossen!")

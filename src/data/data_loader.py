@@ -98,7 +98,6 @@ class voxelDataset:
             base = base.shuffle(buffer_size=buffer_size)
 
         def _add_noise(phi, target):
-            # noise for randomly chosen time step between 0 and T
             t = tf.random.uniform([], minval=0, maxval=self.T, dtype=tf.int32)
             alpha_t = tf.gather(self.alphas_cumprod, t)
             sqrt_alpha = tf.sqrt(alpha_t)
@@ -108,9 +107,9 @@ class voxelDataset:
             return phi, x_noisy, noise, t
 
         return (base
-                .map(_add_noise, num_parallel_calls=2)  # Begrenzte Parallelität
+                .map(_add_noise, num_parallel_calls=tf.data.AUTOTUNE)  # ← PARALLEL!
                 .batch(batch_size)
-                .prefetch(2))  # Kleinerer Prefetch-Buffer
+                .prefetch(tf.data.AUTOTUNE))  # ← PREFETCH!
     
     def get_small_test_dataset(self, batch_size: int=8, num_samples: int=100):
         """Kleines Test-Dataset für Memory-Tests"""
