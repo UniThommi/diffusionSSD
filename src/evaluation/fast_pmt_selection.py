@@ -35,8 +35,8 @@ class FastSelectionConfig:
     """Konfiguration für schnelle PMT-Selektion"""
     # Model
     checkpoint_path: str = "./checkpoints_cpu/checkpoint_epoch_5_model.weights.h5"
-    phi_dim: int = 22
-    target_dim: int = 7789
+    phi_dim: int = 23
+    target_dim: int = 9583
     T: int = 1000
     hidden_dim: int = 512
     n_layers: int = 4

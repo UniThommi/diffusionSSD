@@ -1,0 +1,50 @@
+# ============================================================================
+# Diffusion Model Training Configuration
+# ============================================================================
+# Reference: Ho et al. (2020) - Denoising Diffusion Probabilistic Models
+#            Nichol & Dhariwal (2021) - Improved DDPM (Cosine Schedule)
+# ============================================================================
+
+# === Data ===
+data_path = "/pscratch/sd/t/tbuerger/data/optPhotonSensitiveSurface/outdated/resumFormatcurrentDistZylSSD300PMTs/resum_output_0.hdf5"
+phi_dim = 23
+target_dim = 9583
+
+# === Diffusion Schedule ===
+# Reference: Nichol & Dhariwal (2021) - Improved DDPM
+# Cosine schedule provides better sample quality than linear
+diffusion_T = 1000
+diffusion_beta_start = 0.0001
+diffusion_beta_end = 0.02
+diffusion_schedule_type = "cosine"
+
+# === Model Architecture ===
+model_hidden_dim = 512
+model_n_layers = 6
+model_t_emb_dim = 64
+
+# === Training Parameters ===
+training_batch_size = 64
+training_learning_rate = 0.0001
+training_epochs = 30
+training_steps_per_epoch = 250
+training_gradient_clip_norm = 1.0
+training_patience = 5
+
+# === Optimizations ===
+training_use_lr_schedule = true
+training_use_ema = true
+training_ema_decay = 0.9999
+
+# === Validation ===
+validation_split_ratio = 0.1
+validation_n_batches = 20
+validation_batch_size_multiplier = 2
+
+# === Paths ===
+checkpoint_dir = "./checkpoints_cpu"
+log_dir = "./training_logs"
+save_every_n_epochs = 1
+
+# === Experiment Tracking ===
+experiment_name = "optimized_training_v2"

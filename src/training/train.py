@@ -2,6 +2,11 @@
 """
 training_optimization_system.py
 
+Training System für Diffusion Model auf CPU
+
+WICHTIG: Dieses Training läuft AUSSCHLIESSLICH auf CPU.
+GPU-Support ist aufgrund von CUDA-Problemen auf NERSC deaktiviert.
+
 Umfassendes System für Training-Beschleunigung und Hyperparameter-Optimierung
 
 Basiert auf State-of-the-Art Papers:
@@ -36,6 +41,7 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass, asdict
 from data.data_loader import voxelDataset
 from models.diffusion_model import build_diffusion_model
+from config.config_loader import ConfigLoader
 from tensorflow.keras.optimizers.schedules import CosineDecay
 
 
@@ -62,11 +68,6 @@ class TrainingMetrics:
     best_val_loss: float
     training_time_seconds: float
     samples_per_second: float
-    
-    # Physics Metrics (falls Physics Loss aktiv)
-    physics_loss: Optional[float] = None
-    energy_violation: Optional[float] = None
-    multiplicity_success_rate: Optional[float] = None
     
     # Resource Usage
     peak_memory_mb: Optional[float] = None
@@ -172,9 +173,6 @@ class TrainingLogger:
         self.log(f"  Val Loss:   {metrics.val_loss:.6f}")
         self.log(f"  Time:       {metrics.training_time_seconds:.1f}s")
         self.log(f"  Throughput: {metrics.samples_per_second:.1f} samples/s")
-        
-        if metrics.physics_loss is not None:
-            self.log(f"  Physics Loss: {metrics.physics_loss:.6f}")
     
     def save_summary(self):
         """Save comprehensive summary for Claude"""
@@ -301,27 +299,61 @@ class OptimizedTrainer:
     5. Early Stopping
     """
     
-    def __init__(self, config: Dict, experiment_name: str = None):
-        self.config = config
-    
-        # Nutze Config-Experiment-Name falls vorhanden
-        if experiment_name is None:
-            experiment_name = config.get('experiment_name', 
-                                        f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    def __init__(self, config_path: str = None):
+        """
+        Initialize optimized trainer from config.toml ONLY
         
-        self.logger = TrainingLogger(config['log_dir'], experiment_name)
+        Args:
+            config_path: Path to config.toml. If None, searches in project root.
         
-        if experiment_name is None:
-            experiment_name = f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        Note:
+            Dict-based config is NO LONGER SUPPORTED.
+            All parameters must come from config.toml with explicit experiment_name.
         
-        self.logger = TrainingLogger(config['log_dir'], experiment_name)
+        Raises:
+            ValueError: If any required config key is missing
+        """
+        # Lade Config aus TOML (strikte Validierung)
+        cfg_loader = ConfigLoader(config_path)
+        
+        # Baue Config Dict
+        self.config = {
+            'data_path': cfg_loader.config['data_path'],
+            'phi_dim': cfg_loader.config['phi_dim'],
+            'target_dim': cfg_loader.config['target_dim'],
+            'T': cfg_loader.diffusion_schedule.T,
+            'hidden_dim': cfg_loader.config['model_hidden_dim'],
+            'n_layers': cfg_loader.config['model_n_layers'],
+            't_emb_dim': cfg_loader.config['model_t_emb_dim'],
+            'batch_size': cfg_loader.config['training_batch_size'],
+            'learning_rate': cfg_loader.config['training_learning_rate'],
+            'epochs': cfg_loader.config['training_epochs'],
+            'steps_per_epoch': cfg_loader.config['training_steps_per_epoch'],
+            'gradient_clip_norm': cfg_loader.config['training_gradient_clip_norm'],
+            'patience': cfg_loader.config['training_patience'],
+            'use_lr_schedule': cfg_loader.config['training_use_lr_schedule'],
+            'use_ema': cfg_loader.config['training_use_ema'],
+            'ema_decay': cfg_loader.config['training_ema_decay'],
+            'checkpoint_dir': cfg_loader.config['checkpoint_dir'],
+            'log_dir': cfg_loader.config['log_dir'],
+            'save_every_n_epochs': cfg_loader.config['save_every_n_epochs'],
+            'experiment_name': cfg_loader.config['experiment_name']
+        }
+        
+        # Diffusion Schedule
+        self.diffusion_schedule = cfg_loader.diffusion_schedule.to_dict()
+        
+        # Experiment Name aus Config (nicht generiert!)
+        experiment_name = self.config['experiment_name']
+        
+        self.logger = TrainingLogger(self.config['log_dir'], experiment_name)
         
         # Load data
         self.logger.log("\nLade Daten...")
-        loader = voxelDataset(config['data_path'])
+        loader = voxelDataset(self.config['data_path'])
         
         # Split 90/10
-        n_total_batches = loader.n_events // config['batch_size']
+        n_total_batches = loader.n_events // self.config['batch_size']
         n_train_batches = int(0.9 * n_total_batches)
         n_val_batches = n_total_batches - n_train_batches
         
@@ -331,15 +363,18 @@ class OptimizedTrainer:
         
         # Create datasets
         full_dataset = loader.get_noisy_dataset(
-            batch_size=config['batch_size'],
+            batch_size=self.config['batch_size'],
+            diffusion_schedule=self.diffusion_schedule,
             shuffle=True,
-            buffer_size=10000
+            buffer_size=1000
         )
         
         self.train_dataset = full_dataset.take(n_train_batches)
+        
         # WICHTIG: Validation mit GRÖSSEREM Batch für Geschwindigkeit
         self.val_dataset = loader.get_noisy_dataset(
-            batch_size=config['batch_size'] * 2,  # 2x größer!
+            batch_size=self.config['batch_size'] * 2,
+            diffusion_schedule=self.diffusion_schedule,
             shuffle=False,
             buffer_size=500
         ).skip(n_train_batches // 2).take(n_val_batches // 2)
@@ -347,12 +382,12 @@ class OptimizedTrainer:
         # Build model
         self.logger.log("\nErstelle Modell...")
         self.model = build_diffusion_model(
-            phi_dim=config['phi_dim'],
-            target_dim=config['target_dim'],
-            T=config['T'],
-            hidden_dim=config['hidden_dim'],
-            n_layers=config['n_layers'],
-            t_emb_dim=config['t_emb_dim']
+            phi_dim=self.config['phi_dim'],
+            target_dim=self.config['target_dim'],
+            T=self.config['T'],
+            hidden_dim=self.config['hidden_dim'],
+            n_layers=self.config['n_layers'],
+            t_emb_dim=self.config['t_emb_dim']
         )
         
         # Model info
@@ -366,174 +401,110 @@ class OptimizedTrainer:
         self.loss_fn = tf.keras.losses.MeanSquaredError()
 
         # ===== OPTIMIZER MIT LR SCHEDULE =====
-        if config.get('use_lr_schedule', False):
+        if self.config.get('use_lr_schedule', False):
             self.logger.log("\n✓ Using Cosine Annealing LR Schedule")
-            total_steps = config['epochs'] * config['steps_per_epoch']
+            total_steps = self.config['epochs'] * self.config['steps_per_epoch']
             
             lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-                initial_learning_rate=config['learning_rate'],
+                initial_learning_rate=self.config['learning_rate'],
                 decay_steps=total_steps,
                 alpha=1e-6
             )
             self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
         else:
             self.logger.log("\n✓ Using constant learning rate")
-            self.optimizer = tf.keras.optimizers.Adam(learning_rate=config['learning_rate'])
+            self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.config['learning_rate'])
 
         # ===== EMA INITIALISIERUNG =====
-        if config.get('use_ema', False):
+        if self.config['use_ema']:
             self.logger.log("✓ Initializing EMA model")
             self.ema_model = tf.keras.models.clone_model(self.model)
             self.ema_model.set_weights(self.model.get_weights())
-            self.ema_decay = config.get('ema_decay', 0.9999)
+            self.ema_decay = self.config['ema_decay']
         else:
             self.ema_model = None
 
-        # Diffusion schedule (für Physics Loss)
-        betas = tf.linspace(1e-4, 0.02, config['T'])
-        self.alphas = 1.0 - betas
-        self.alphas_cumprod = tf.math.cumprod(self.alphas)
-
-    def compute_physics_loss(self, x_pred, x_true, phi, weight=0.1):
+    # CPU-specific optimizations
+        self._setup_cpu_optimizations()
+        
+        # Diffusion schedule (für Training)
+        self.alphas_cumprod = self.diffusion_schedule['alphas_cumprod']
+        
+        # Fast Validation
+        self.fast_validator = FastValidation(self.model, self.loss_fn, self.config)
+        
+        # Training state
+        self.best_val_loss = float('inf')
+        self.patience_counter = 0
+        self.current_epoch = 0
+    
+    def _setup_cpu_optimizations(self):
         """
-        Material-bewusster Physics Loss
+        Setup TensorFlow für CPU-only Training
         
-        Prüft:
-        1. Energieerhaltung PRO MATERIAL
-        2. Multiplizität (N≥6 Voxel aktiv)
-        
-        Args:
-            x_pred: Predicted signal (batch, 7789)
-            x_true: True signal (batch, 7789)
-            phi: NC parameters (batch, 22)
-            weight: Gewichtung des Physics Loss
+        WICHTIG: GPU ist auf NERSC aufgrund CUDA-Problemen deaktiviert
         """
-        batch_size = tf.shape(x_pred)[0]
+        # Verify CPU-only mode
+        gpus = tf.config.list_physical_devices('GPU')
+        if len(gpus) > 0:
+            self.logger.log(f"⚠ WARNING: {len(gpus)} GPU(s) detected but training is CPU-only")
+            self.logger.log(f"  GPU usage is disabled via environment variables")
         
-        # Extrahiere Material-IDs (phi[:, 18] = matID)
-        mat_ids = phi[:, 18]
+        # Set float32 policy (no mixed precision on CPU)
+        tf.keras.mixed_precision.set_global_policy('float32')
         
-        # Extrahiere Energien (phi[:, 1] = E_gamma_tot_keV)
-        energies = phi[:, 1]
+        # Disable TF32 (not supported on CPU anyway)
+        tf.config.experimental.enable_tensor_float_32_execution(False)
         
-        # 1. ENERGIEERHALTUNG PRO MATERIAL
-        signal_sum_pred = tf.reduce_sum(x_pred, axis=1)  # (batch,)
-        signal_sum_true = tf.reduce_sum(x_true, axis=1)  # (batch,)
-        
-        # Relative Abweichung (nur wenn signal_sum_true > 0)
-        safe_denom = tf.maximum(signal_sum_true, 1e-6)
-        energy_violation = tf.abs(signal_sum_pred - signal_sum_true) / safe_denom
-        
-        # Gewichte nach Material (höhere Strafen für gut bekannte Materialien)
-        # matID: 0=Water, 1=LAr, 2=Steel, 3=Copper
-        material_weights = tf.where(
-            tf.equal(mat_ids, 1.0),  # LAr (Hauptdetektor)
-            tf.constant(2.0, dtype=tf.float32),  # Höhere Gewichtung
-            tf.constant(1.0, dtype=tf.float32)   # Normale Gewichtung
-        )
-        
-        energy_loss = tf.reduce_mean(energy_violation * material_weights)
-        
-        # 2. MULTIPLIZITÄTS-CONSTRAINT (N≥6 Voxel)
-        threshold = 0.5
-        active_pred = tf.cast(x_pred > threshold, tf.float32)
-        active_true = tf.cast(x_true > threshold, tf.float32)
-        
-        mult_pred = tf.reduce_sum(active_pred, axis=1)  # (batch,)
-        mult_true = tf.reduce_sum(active_true, axis=1)  # (batch,)
-        
-        # Loss: Abweichung von N=6 Constraint
-        mult_loss = tf.reduce_mean(tf.abs(mult_pred - mult_true))
-        
-        # 3. KOMBINIERTER PHYSICS LOSS
-        total_physics = 0.6 * energy_loss + 0.4 * mult_loss
-        
-        return weight * total_physics, energy_loss, mult_loss
-            
+        self.logger.log("✓ CPU-only training mode confirmed")            
     
     @tf.function(reduce_retracing=True)
     def train_step(self, batch):
-        """Optimized training step mit Physics Loss"""
+        """Optimized training step - Pure DDPM loss only"""
         phi_b, x_noisy_b, noise_b, t_b = batch
         
         with tf.GradientTape() as tape:
             # Noise prediction
             predictions = self.model([x_noisy_b, phi_b, t_b], training=True)
             
-            # Diffusion Loss (MSE)
-            diffusion_loss = self.loss_fn(noise_b, predictions)
-            
-            # Physics Loss (nur wenn aktiviert)
-            if self.config.get('use_physics_loss', False):
-                # Approximate x_0 von x_noisy
-                alpha_t = tf.gather(self.alphas_cumprod, t_b)
-                sqrt_alpha = tf.sqrt(alpha_t)
-                sqrt_one_minus = tf.sqrt(1.0 - alpha_t)
-                
-                # x_0 ≈ (x_noisy - sqrt(1-α)*ε) / sqrt(α)
-                x_pred = (x_noisy_b - sqrt_one_minus[:, None] * predictions) / (sqrt_alpha[:, None] + 1e-8)
-                x_true = (x_noisy_b - sqrt_one_minus[:, None] * noise_b) / (sqrt_alpha[:, None] + 1e-8)
-                
-                physics_loss, energy_loss, mult_loss = self.compute_physics_loss(
-                    x_pred, x_true, phi_b, weight=self.config.get('physics_loss_weight', 0.1)
-                )
-                
-                total_loss = diffusion_loss + physics_loss
-            else:
-                physics_loss = tf.constant(0.0)
-                energy_loss = tf.constant(0.0)
-                mult_loss = tf.constant(0.0)
-                total_loss = diffusion_loss
+            # Diffusion Loss (MSE) - Ho et al. (2020) DDPM
+            loss = self.loss_fn(noise_b, predictions)
         
         # Gradients
-        gradients = tape.gradient(total_loss, self.model.trainable_variables)
+        gradients = tape.gradient(loss, self.model.trainable_variables)
         
         # Gradient clipping
-        if self.config.get('gradient_clip_norm', None):
-            gradients, _ = tf.clip_by_global_norm(gradients, self.config['gradient_clip_norm'])
+        gradients, _ = tf.clip_by_global_norm(gradients, self.config['gradient_clip_norm'])
         
-        # Apply
+        # Apply gradients
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         
-        # EMA Update (nach jedem Step!)
+        # EMA Update (optional, after each step)
         if self.ema_model is not None:
             for ema_var, model_var in zip(self.ema_model.trainable_variables, 
                                         self.model.trainable_variables):
                 ema_var.assign(self.ema_decay * ema_var + (1 - self.ema_decay) * model_var)
         
-        return total_loss, diffusion_loss, physics_loss
+        return loss
     
     def train_epoch(self):
-        """Train one epoch mit Physics Loss Tracking"""
+        """Train one epoch - Pure diffusion training"""
         epoch_start = time.time()
         
         losses = []
-        diffusion_losses = []
-        physics_losses = []
         n_samples = 0
         
         for step, batch in enumerate(self.train_dataset.take(self.config['steps_per_epoch'])):
-            total_loss, diff_loss, phys_loss = self.train_step(batch)
-            
-            losses.append(total_loss.numpy())
-            diffusion_losses.append(diff_loss.numpy())
-            physics_losses.append(phys_loss.numpy())
+            loss = self.train_step(batch)
+            losses.append(loss.numpy())
             
             n_samples += self.config['batch_size']
             
             if (step + 1) % 10 == 0:
-                if self.config.get('use_physics_loss', False):
-                    self.logger.log(
-                        f"  Step {step+1}/{self.config['steps_per_epoch']}: "
-                        f"Total={total_loss.numpy():.6f}, "
-                        f"Diff={diff_loss.numpy():.6f}, "
-                        f"Phys={phys_loss.numpy():.6f}"
-                    )
-                else:
-                    self.logger.log(
-                        f"  Step {step+1}/{self.config['steps_per_epoch']}: "
-                        f"Loss={total_loss.numpy():.6f}"
-                    )
+                self.logger.log(
+                    f"  Step {step+1}/{self.config['steps_per_epoch']}: "
+                    f"Loss={loss.numpy():.6f}"
+                )
         
         epoch_time = time.time() - epoch_start
         avg_loss = np.mean(losses)
@@ -542,8 +513,12 @@ class OptimizedTrainer:
         return avg_loss, epoch_time, throughput
     
     def validate(self):
-        """Fast validation mit Variance-Check"""
-        # Normale Validation
+        """
+        Fast validation with optional variance check
+        
+        Variance check helps detect mode collapse (model predicting constants)
+        """
+        # Use EMA model for validation if available
         if self.ema_model is not None:
             original_model = self.fast_validator.model
             self.fast_validator.model = self.ema_model
@@ -552,8 +527,8 @@ class OptimizedTrainer:
         else:
             val_loss = self.fast_validator.validate(self.val_dataset, n_batches=20)
         
-        # HYPOTHESE 1 TEST: Prüfe ob Model nur Durchschnitt lernt
-        if self.current_epoch % 5 == 0:  # Alle 5 Epochs
+        # Variance check every 5 epochs (detects mode collapse)
+        if self.current_epoch % 5 == 0:
             self.logger.log("\n  [Variance Check]")
             pred_vars = []
             for batch in self.val_dataset.take(10):
@@ -566,9 +541,9 @@ class OptimizedTrainer:
             self.logger.log(f"  Prediction Variance: {avg_var:.6f}")
             
             if avg_var < 0.01:
-                self.logger.log("  ⚠️ WARNING: Model may be predicting constant values!")
+                self.logger.log("  ⚠️ WARNING: Low variance - possible mode collapse!")
             else:
-                self.logger.log("  ✓ Model predictions vary (learning)")
+                self.logger.log("  ✓ Model predictions vary normally")
         
         return val_loss
     
@@ -646,54 +621,28 @@ class OptimizedTrainer:
 
 
 def main():
-    """Example usage"""
-    config = {
-        # Data
-        'data_path': '/pscratch/sd/t/tbuerger/data/optPhotonSensitiveSurface/outdated/resumFormatcurrentDistZylSSD300PMTs/resum_output_0.hdf5',
-        'phi_dim': 22,
-        'target_dim': 7789,
-        'T': 1000,
-        
-        # Model Architecture
-        'hidden_dim': 512,
-        'n_layers': 6,
-        't_emb_dim': 64,
-        
-        # Training Parameters
-        'batch_size': 64,          # VERDOPPELT von 32 → mehr Effizienz
-        'learning_rate': 1e-4,     # ERHÖHT von 5e-5 → schnellere Konvergenz
-        'epochs': 30,
-        'steps_per_epoch': 250,    # ERHÖHT von 200 → mehr Daten pro Epoch
-        'gradient_clip_norm': 1.0,
-        'patience': 5,
-        
-        # Optimizations (NEU!)
-        'use_lr_schedule': True,           # Cosine Annealing
-        'use_ema': True,                   # Exponential Moving Average
-        'ema_decay': 0.9999,
-        'use_physics_loss': True,          # Material-aware Physics
-        'physics_loss_weight': 0.3,        # 10% Gewichtung
-        
-        # Paths
-        'checkpoint_dir': './checkpoints_cpu',
-        'log_dir': './training_logs',
-        'experiment_name': 'optimized_training_v2',
-    }
-
-    # LR Schedule:
-    total_steps = config['epochs'] * config['steps_per_epoch']
+    """
+    Training with config.toml ONLY
     
-    # Create directories
-    Path(config['checkpoint_dir']).mkdir(exist_ok=True)
-    Path(config['log_dir']).mkdir(exist_ok=True)
+    Usage:
+        python training_optimization_system.py
+        
+    All parameters are read from config.toml in project root.
+    To run different experiments, change experiment_name in config.toml.
+    """
+    # Train - alle Parameter aus config.toml
+    trainer = OptimizedTrainer(config_path=None)
+    
+    # Directories aus Config
+    Path(trainer.config['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
+    Path(trainer.config['log_dir']).mkdir(parents=True, exist_ok=True)
     
     # Train
-    trainer = OptimizedTrainer(config)
     model = trainer.train()
     
     print("\n✓ Training abgeschlossen!")
     print(f"  Logs: {trainer.logger.log_dir}")
-    print(f"  Best Model: {config['checkpoint_dir']}/best_model.weights.h5")
+    print(f"  Best Model: {trainer.config['checkpoint_dir']}/best_model.weights.h5")
 
 
 if __name__ == "__main__":

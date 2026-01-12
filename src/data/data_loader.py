@@ -9,41 +9,21 @@ class voxelDataset:
     "gammapx1", "gammapx2", "gammapx3", "gammapx4",
     "gammapy1", "gammapy2", "gammapy3", "gammapy4",
     "gammapz1", "gammapz2", "gammapz3", "gammapz4",
-    "matID", "xNC_mm", "yNC_mm", "zNC_mm"
+    "matID", "volID", "xNC_mm", "yNC_mm", "zNC_mm"
     ]
     def __init__(self, h5_path: str, T: int=1000, beta_start: float=1e-4, beta_end: float=0.02):
         self.h5_path = h5_path
         # Read out shapes
         with h5py.File(h5_path, "r")as f:
             if "phi" not in f or "target" not in f:
-                raise ValueError("HDF5 must contain 'targe' and 'phi' groups")
+                raise ValueError("HDF5 must contain 'target' and 'phi' groups")
             self.n_events =f["phi"]["#gamma"].shape[0]
             self.voxel_keys = list(f["target"].keys())
 
-        self.phi_dim = len(self.PHI) # 22
-        self.target_dim = len(self.voxel_keys) # 7789
+        self.phi_dim = len(self.PHI) 
+        self.target_dim = len(self.voxel_keys) 
 
-        # Diffusion parameter
-        betas = tf.linspace(beta_start, beta_end, T)    # noise schedule
-        alphas = 1.0 - betas                            # signal = total - noise
-        self.alphas_cumprod = tf.math.cumprod(alphas)   # cumulative product of signal after n steps (hom much signal is left)
-        self.T = T                                      # time steps
-
-    def _generator(self):
-        """Original generator"""
-        with h5py.File(self.h5_path, "r") as f:
-            phi_group = f["phi"]
-            target_group = f["target"]
-
-            phi_dsets = [phi_group[name] for name in self.PHI]
-            voxel_dsets = [target_group[key] for key in self.voxel_keys]
-
-            for i in range(self.n_events):
-                phi = np.array([ds[i] for ds in phi_dsets], dtype=np.float32)
-                target = np.array([ds[i] for ds in voxel_dsets], dtype=np.float32)
-                yield phi, target
-
-    def _generator_chunked(self, chunk_size=1000):
+    def _generator_chunked(self, chunk_size):
         """Memory-effizienterer Generator mit Chunking"""
         with h5py.File(self.h5_path, "r") as f:
             phi_group = f["phi"]
@@ -73,33 +53,41 @@ class voxelDataset:
         output_signature = (
             tf.TensorSpec(shape=(self.phi_dim,), dtype=tf.float32),
             tf.TensorSpec(shape=(self.target_dim,), dtype=tf.float32),
+        )        
+        ds = tf.data.Dataset.from_generator(
+            lambda: self._generator_chunked(chunk_size=1000), 
+            output_signature=output_signature
         )
-        
-        if use_chunking:
-            ds = tf.data.Dataset.from_generator(
-                lambda: self._generator_chunked(chunk_size=1000), 
-                output_signature=output_signature
-            )
-        else:
-            ds = tf.data.Dataset.from_generator(self._generator, output_signature=output_signature)
-        
         if shuffle:
-            # Kleinerer Buffer für Memory-Effizienz
             ds = ds.shuffle(buffer_size=min(5000, self.n_events))
         return ds
     
     
-    def get_noisy_dataset(self, batch_size: int=32, shuffle: bool=True, buffer_size: int=1000):
-        # Memory-effiziente mit kontrollierten Buffern
-        base = self.get_base_dataset(shuffle=False, use_chunking=True)  # Chunking verwenden
+    def get_noisy_dataset(self, batch_size: int = 32, diffusion_schedule: dict = None, 
+                         shuffle: bool = True, buffer_size: int = 1000):
+        """
+        Erstelle noisy dataset für Diffusion Training
         
-        if shuffle:
-            # Kontrollierter Shuffle-Buffer
-            base = base.shuffle(buffer_size=buffer_size)
+        Args:
+            batch_size: Training batch size
+            diffusion_schedule: Dict mit 'T' und 'alphas_cumprod' aus config
+            shuffle: Shuffle data
+            buffer_size: Shuffle buffer size
+        """
+        if diffusion_schedule is None:
+            raise ValueError(
+                "Must provide diffusion_schedule from config!\n"
+                "Usage: config = ConfigLoader(); schedule = config.diffusion_schedule.to_dict()"
+            )
+        
+        T = diffusion_schedule['T']
+        alphas_cumprod = diffusion_schedule['alphas_cumprod']
+        
+        base = self.get_base_dataset(shuffle=shuffle, buffer_size=buffer_size)
 
         def _add_noise(phi, target):
-            t = tf.random.uniform([], minval=0, maxval=self.T, dtype=tf.int32)
-            alpha_t = tf.gather(self.alphas_cumprod, t)
+            t = tf.random.uniform([], minval=0, maxval=T, dtype=tf.int32)
+            alpha_t = tf.gather(alphas_cumprod, t)
             sqrt_alpha = tf.sqrt(alpha_t)
             sqrt_one_minus = tf.sqrt(1.0 - alpha_t)
             noise = tf.random.normal(shape=tf.shape(target), dtype=tf.float32)
@@ -111,7 +99,8 @@ class voxelDataset:
                 .batch(batch_size)
                 .prefetch(tf.data.AUTOTUNE))  # ← PREFETCH!
     
-    def get_small_test_dataset(self, batch_size: int=8, num_samples: int=100):
+    # Für Debugging
+    def get_small_test_dataset(self, batch_size: int=8, num_samples: int=100): 
         """Kleines Test-Dataset für Memory-Tests"""
         base = self.get_base_dataset(shuffle=False, use_chunking=True)
         
@@ -130,6 +119,7 @@ class voxelDataset:
                 .batch(batch_size)
                 .prefetch(1))
 
+    # Testing 
     def check_memory_usage(self):
         """Memory-Usage Check"""
         print(f"Dataset Info:")
@@ -174,7 +164,7 @@ if __name__ == "__main__":
         
         # Test memory-efficient dataset
         print("Testing memory-efficient dataset...")
-        efficient_ds = loader.get_noisy_dataset_memory_efficient(
+        efficient_ds = loader.get_noisy_dataset(
             batch_size=args.batch, 
             buffer_size=500
         )
@@ -190,7 +180,7 @@ if __name__ == "__main__":
             print("target sample (first 20):", target[:20].numpy())
 
         print("\n=== Memory-efficient Noisy-Batch ===")
-        noisy_ds = loader.get_noisy_dataset_memory_efficient(
+        noisy_ds = loader.get_noisy_dataset(
             batch_size=args.batch, 
             shuffle=True, 
             buffer_size=1000
