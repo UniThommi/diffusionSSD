@@ -48,3 +48,73 @@ save_every_n_epochs = 1
 
 # === Experiment Tracking ===
 experiment_name = "optimized_training_v2"
+
+# ============================================================================
+# Feature Selection & Normalization
+# ============================================================================
+
+[features]
+# Verfügbare PHI-Features (Referenz - vollständige Liste)
+available_phi = [
+    "#gamma", "E_gamma_tot_keV",
+    "gammaE1_keV", "gammaE2_keV", "gammaE3_keV", "gammaE4_keV",
+    "gammapx1", "gammapx2", "gammapx3", "gammapx4",
+    "gammapy1", "gammapy2", "gammapy3", "gammapy4",
+    "gammapz1", "gammapz2", "gammapz3", "gammapz4",
+    "xNC_mm", "yNC_mm", "zNC_mm",
+    "r_NC_mm", "phi_NC_rad",
+    "dist_to_wall_mm", "dist_to_bot_mm", "dist_to_top_mm",
+    "p_mean_r", "p_mean_z",
+    "matID", "volID"
+]
+
+# Aktive Features für Training (xNC_mm, yNC_mm standardmäßig ausgeschlossen)
+active_phi = [
+    "#gamma", "E_gamma_tot_keV",
+    "gammaE1_keV", "gammaE2_keV", "gammaE3_keV", "gammaE4_keV",
+    "gammapx1", "gammapx2", "gammapx3", "gammapx4",
+    "gammapy1", "gammapy2", "gammapy3", "gammapy4",
+    "gammapz1", "gammapz2", "gammapz3", "gammapz4",
+    "zNC_mm", "r_NC_mm", "phi_NC_rad",
+    "dist_to_wall_mm", "dist_to_bot_mm", "dist_to_top_mm",
+    "p_mean_r", "p_mean_z",
+    "matID", "volID"
+]
+
+[normalization]
+# Energie (alle auf E_gamma_tot_keV normiert für Energieerhaltung)
+E_max = 10000.0  # [keV] - Aus Analyse-Skript überschreiben
+
+# Geometrie
+r_cylinder = 4300.0  # [mm]
+z_min = -4980.0      # [mm]
+z_max = 3920.0       # [mm]
+
+# Winkel
+angle_max = 6.283185307179586  # 2π
+
+# Voxel-Hits (target)
+voxel_hit_max = 100.0  # Aus Analyse-Skript überschreiben
+
+[features.mappings]
+# Pfade zu Material- und Volume-Mappings
+material_mapping_file = "/global/cfs/projectdirs/legend/users/tbuerger/postprocessing/src/mappings/globalMaterialMappings.json"
+volume_mapping_file = "/global/cfs/projectdirs/legend/users/tbuerger/postprocessing/src/mappings/globalPhysVolMappings.json"
+
+[features.one_hot]
+# One-Hot Encoding aktivieren
+enable_material_onehot = true
+enable_volume_onehot = true
+
+[normalization.region_areas]
+# Flächenverhältnisse (Referenz: kleinste Region = 1.0)
+reference_region = "pit"
+
+area_ratio_pit  = 1.0
+area_ratio_bot  = 1.0
+area_ratio_wall = 4.14
+area_ratio_top  = 1.0
+
+[normalization.region_hits]
+# Globaler Normierungsfaktor nach Flächenkorrektur
+max_hit_global = 500.0  # Aus Analyse-Skript überschreiben

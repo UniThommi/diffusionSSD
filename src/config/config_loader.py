@@ -87,6 +87,45 @@ class ConfigLoader:
         if self.config['diffusion_beta_start'] >= self.config['diffusion_beta_end']:
             raise ValueError("diffusion_beta_start must be < diffusion_beta_end")
     
+    def get_feature_config(self) -> Dict[str, Any]:
+        """Get feature selection configuration"""
+        return {
+            'available_phi': self.config['features']['available_phi'],
+            'active_phi': self.config['features']['active_phi']
+        }
+    
+    def get_mapping_config(self) -> Dict[str, Any]:
+        """Get mapping file paths"""
+        return {
+            'material_mapping_file': self.config['features']['mappings']['material_mapping_file'],
+            'volume_mapping_file': self.config['features']['mappings']['volume_mapping_file']
+        }
+    
+    def get_onehot_config(self) -> Dict[str, Any]:
+        """Get One-Hot encoding configuration"""
+        return {
+            'enable_material_onehot': self.config['features']['one_hot']['enable_material_onehot'],
+            'enable_volume_onehot': self.config['features']['one_hot']['enable_volume_onehot']
+        }
+    
+    def get_normalization_config(self) -> Dict[str, Any]:
+        """Get normalization parameters - NO DEFAULTS"""
+        return {
+            'E_max': self.config['normalization']['E_max'],
+            'r_cylinder': self.config['normalization']['r_cylinder'],
+            'z_min': self.config['normalization']['z_min'],
+            'z_max': self.config['normalization']['z_max'],
+            'angle_max': self.config['normalization']['angle_max'],
+            'voxel_hit_max': self.config['normalization']['voxel_hit_max'],
+            'area_ratios': {
+                'pit': self.config['normalization']['region_areas']['area_ratio_pit'],
+                'bot': self.config['normalization']['region_areas']['area_ratio_bot'],
+                'wall': self.config['normalization']['region_areas']['area_ratio_wall'],
+                'top': self.config['normalization']['region_areas']['area_ratio_top']
+            },
+            'region_hit_max_global': self.config['normalization']['region_hits']['max_hit_global']
+        }
+    
     def _create_diffusion_schedule(self) -> DiffusionSchedule:
         """
         Create diffusion noise schedule
