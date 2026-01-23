@@ -1,30 +1,85 @@
 # ============================================================================
-# Diffusion Model Training Configuration
+# NC-Score: Diffusion Model for Neutron Capture Optical Response
 # ============================================================================
-# Reference: Ho et al. (2020) - Denoising Diffusion Probabilistic Models
-#            Nichol & Dhariwal (2021) - Improved DDPM (Cosine Schedule)
+# Based on: CaloScore v2 (Vishwasrao et al. 2025, arXiv:2410.21611)
 # ============================================================================
 
 # === Data ===
 data_path = "/pscratch/sd/t/tbuerger/data/optPhotonSensitiveSurface/outdated/resumFormatcurrentDistZylSSD300PMTs/resum_output_0.hdf5"
-phi_dim = 23
-target_dim = 9583
+target_dim = 9583  # Total voxels
 
 # === Diffusion Schedule ===
 # Reference: Nichol & Dhariwal (2021) - Improved DDPM
 # Cosine schedule provides better sample quality than linear
-diffusion_T = 1000
+diffusion_T = 512  # CaloScore standard
 diffusion_beta_start = 0.0001
 diffusion_beta_end = 0.02
 diffusion_schedule_type = "cosine"
 
 # === Model Architecture ===
-model_hidden_dim = 512
-model_n_layers = 6
-model_t_emb_dim = 64
+# Stage 1 (ResNet-MLP): φ → Region Hits
+stage1_num_regions = 4  # [pit, bot, wall, top]
+stage1_mlp_dim = 512
+stage1_num_layers = 3
+stage1_embed_dim = 256
+
+# Stage 2 (U-Nets): Region Hits + φ → Voxels
+stage2_embed_dim = 256
+
+# Time embedding (shared across stages)
+time_embed_dim = 256
+
+# EMA
+ema_decay = 0.999
+
+# === Region Grid Shapes (PLACEHOLDER - anpassen!) ===
+[regions]
+# Pit: Kartesisches Grid mit Kreismaske
+pit_shape = [40, 40]
+pit_n_voxels = 1261
+
+# Bot: Ring-Grid
+bot_shape = [24, 24]
+bot_n_voxels = 400
+
+# Top: Ring-Grid
+top_shape = [44, 44]
+top_n_voxels = 1528
+
+# Wall: Zylindrisch unwrapped (z, theta)
+wall_shape = [50, 128]  # [n_z, n_theta]
+wall_n_voxels = 6394
+
+# === U-Net Hyperparameter (per Region) ===
+[unet]
+# Pit/Bot/Top: 2D kartesisch
+pit_widths = [32, 64, 96, 128]
+pit_attentions = [false, true, true, true]
+pit_block_depth = 4
+pit_kernel_size = 3
+pit_stride = 2
+
+bot_widths = [32, 64, 96]
+bot_attentions = [false, false, true]
+bot_block_depth = 3
+bot_kernel_size = 3
+bot_stride = 2
+
+top_widths = [32, 64, 96, 128]
+top_attentions = [false, true, true, true]
+top_block_depth = 4
+top_kernel_size = 3
+top_stride = 2
+
+# Wall: 2D zylindrisch (Circular Padding entlang theta)
+wall_widths = [32, 64, 96]
+wall_attentions = [false, false, true]
+wall_block_depth = 3
+wall_kernel_size = 3
+wall_stride = 2
 
 # === Training Parameters ===
-training_batch_size = 64
+training_batch_size = 32
 training_learning_rate = 0.0001
 training_epochs = 30
 training_steps_per_epoch = 250
@@ -34,7 +89,9 @@ training_patience = 5
 # === Optimizations ===
 training_use_lr_schedule = true
 training_use_ema = true
-training_ema_decay = 0.9999
+
+# Cosine Annealing (wie CaloScore)
+lr_schedule_type = "cosine"
 
 # === Validation ===
 validation_split_ratio = 0.1
@@ -42,12 +99,12 @@ validation_n_batches = 20
 validation_batch_size_multiplier = 2
 
 # === Paths ===
-checkpoint_dir = "./checkpoints_cpu"
-log_dir = "./training_logs"
+checkpoint_dir = "./checkpoints_nc_score"
+log_dir = "./logs_nc_score"
 save_every_n_epochs = 1
 
 # === Experiment Tracking ===
-experiment_name = "optimized_training_v2"
+experiment_name = "nc_score_baseline"
 
 # ============================================================================
 # Feature Selection & Normalization
@@ -68,22 +125,16 @@ available_phi = [
     "matID", "volID"
 ]
 
-# Aktive Features für Training (xNC_mm, yNC_mm standardmäßig ausgeschlossen)
+# Aktive Features für Training (volID ausgeschlossen, Material via One-Hot)
 active_phi = [
     "#gamma", "E_gamma_tot_keV",
-    "gammaE1_keV", "gammaE2_keV", "gammaE3_keV", "gammaE4_keV",
-    "gammapx1", "gammapx2", "gammapx3", "gammapx4",
-    "gammapy1", "gammapy2", "gammapy3", "gammapy4",
-    "gammapz1", "gammapz2", "gammapz3", "gammapz4",
-    "zNC_mm", "r_NC_mm", "phi_NC_rad",
-    "dist_to_wall_mm", "dist_to_bot_mm", "dist_to_top_mm",
-    "p_mean_r", "p_mean_z",
-    "matID", "volID"
+    "zNC_mm", "r_NC_mm", "phi_NC_rad",y
+    "matID"  # Wird via One-Hot ersetzt
 ]
 
 [normalization]
-# Energie (alle auf E_gamma_tot_keV normiert für Energieerhaltung)
-E_max = 10000.0  # [keV] - Aus Analyse-Skript überschreiben
+# Energie (linear scaling auf E_max)
+E_max = 10000.0  # [keV] - Aus Datenanalyse bestimmen
 
 # Geometrie
 r_cylinder = 4300.0  # [mm]
@@ -94,7 +145,7 @@ z_max = 3920.0       # [mm]
 angle_max = 6.283185307179586  # 2π
 
 # Voxel-Hits (target)
-voxel_hit_max = 100.0  # Aus Analyse-Skript überschreiben
+voxel_hit_max = 100.0  # Aus Datenanalyse bestimmen
 
 [features.mappings]
 # Pfade zu Material- und Volume-Mappings
@@ -102,19 +153,25 @@ material_mapping_file = "/global/cfs/projectdirs/legend/users/tbuerger/postproce
 volume_mapping_file = "/global/cfs/projectdirs/legend/users/tbuerger/postprocessing/src/mappings/globalPhysVolMappings.json"
 
 [features.one_hot]
-# One-Hot Encoding aktivieren
+# One-Hot Encoding aktivieren (nur Material, kein Volume)
 enable_material_onehot = true
-enable_volume_onehot = true
+enable_volume_onehot = false
 
 [normalization.region_areas]
-# Flächenverhältnisse (Referenz: kleinste Region = 1.0)
-reference_region = "pit"
+# Flächenverhältnisse (für Area-Corrected Normalization)
+# Referenz: kleinste Region = 1.0
+reference_region = "bot"
 
-area_ratio_pit  = 1.0
-area_ratio_bot  = 1.0
-area_ratio_wall = 4.14
-area_ratio_top  = 1.0
+area_ratio_pit  = 3.15   # 1261 / 400
+area_ratio_bot  = 1.0    # 400 / 400
+area_ratio_wall = 15.99  # 6394 / 400
+area_ratio_top  = 3.82   # 1528 / 400
 
 [normalization.region_hits]
 # Globaler Normierungsfaktor nach Flächenkorrektur
-max_hit_global = 500.0  # Aus Analyse-Skript überschreiben
+# max_hit_global = max(N_region / area_ratio_region) über alle Events
+max_hit_global = 50.0  # PLACEHOLDER - aus Datenanalyse bestimmen
+
+# Total Fraction (wie CaloScore Layer 0)
+# f_total = Σ(alle Region Hits) / A_gesamt
+total_area = 100000.0  # mm² - PLACEHOLDER
