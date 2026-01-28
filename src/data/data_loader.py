@@ -28,16 +28,6 @@ class voxelDataset:
         "gammaE3_keV", "gammapx3", "gammapy3", "gammapz3",
         "gammaE4_keV", "gammapx4", "gammapy4", "gammapz4"
     ]
-
-    @staticmethod
-    def _get_random_indices(total_events, max_events, seed=42):
-        """Generate random indices for subset selection"""
-        if max_events is None or max_events >= total_events:
-            return None  # Use all events
-    
-        np.random.seed(seed)
-        indices = np.random.choice(total_events, size=max_events, replace=False)
-        return np.sort(indices)  # Sort for efficient HDF5 access
     
     def __init__(self, h5_path: str, config: dict):
         """
@@ -162,23 +152,7 @@ class voxelDataset:
         with h5py.File(h5_path, "r") as f:
             if "phi" not in f or "target" not in f:
                 raise ValueError("HDF5 must contain 'target' and 'phi' groups")
-            total_events = f["phi"]["#gamma"].shape[0]
-            max_events = config['training'].get('max_events', None)
-            shuffle = config['training'].get('shuffle_before_limit', False)
-            # Generate subset indices if needed
-            if max_events is not None and max_events < total_events:
-                if shuffle:
-                    self.event_indices = self._get_random_indices(total_events, max_events)
-                    print(f"  [SUBSET] Using {max_events:,} random events from {total_events:,}")
-                else:
-                    self.event_indices = np.arange(max_events)
-                    print(f"  [SUBSET] Using first {max_events:,} events from {total_events:,}")
-                self.n_events = max_events
-            else:
-                self.event_indices = None
-                self.n_events = total_events
-                print(f"  [FULL DATASET] Using all {total_events:,} events")
-            
+            self.n_events = f["phi"]["#gamma"].shape[0]            
             self.voxel_keys = list(f["target"].keys())
             
             # Check if region targets exist
@@ -306,93 +280,49 @@ class voxelDataset:
             target_regions_group = f["target_regions"]
             
             # Process in chunks
-            # Determine iteration range
-            if self.event_indices is not None:
-                # Subset mode: iterate over selected indices
-                total_indices = len(self.event_indices)
-                for chunk_start in range(rank, total_indices, chunk_size * size):
-                    chunk_end = min(chunk_start + chunk_size, total_indices)
-                    # Get actual HDF5 indices for this chunk
-                    indices_chunk = self.event_indices[chunk_start:chunk_end]
-                    
-                    # Load data using fancy indexing
-                    phi_data_raw = []
-                    for name in self.PHI_HDF5_ORDER:
-                        phi_data_raw.append(phi_group[name][indices_chunk])
-                    phi_chunk_raw = np.array(phi_data_raw, dtype=np.float32).T
-                    
-                    target_data = []
-                    for key in self.voxel_keys:
-                        target_data.append(target_group[key][indices_chunk])
-                    target_chunk_raw = np.array(target_data, dtype=np.float32).T
-                    
-                    region_data = []
-                    for key in self.region_keys:
-                        region_data.append(target_regions_group[key][indices_chunk])
-                    region_chunk_raw = np.array(region_data, dtype=np.float32).T
-                    
-                    # Continue with normalization...
-                    phi_chunk_normalized = self._normalize_phi(phi_chunk_raw)
-                    target_chunk_normalized = self._normalize_target(target_chunk_raw, region_chunk_raw)
-                    region_chunk_normalized = self._normalize_region_targets(region_chunk_raw)
-                    voxel_regions = self._split_voxels_to_regions(target_chunk_normalized)
-                    
-                    for i in range(phi_chunk_normalized.shape[0]):
-                        yield (
-                            {
-                                'PIT': voxel_regions[0][i],
-                                'BOT': voxel_regions[1][i],
-                                'WALL': voxel_regions[2][i],
-                                'TOP': voxel_regions[3][i]
-                            },
-                            region_chunk_normalized[i],
-                            phi_chunk_normalized[i]
-                        )
-            else:
-                # Full dataset mode: sequential access
-                for start_idx in range(rank, self.n_events, chunk_size * size):
-                    end_idx = min(start_idx + chunk_size, self.n_events)
+            for start_idx in range(rank, self.n_events, chunk_size * size):
+                end_idx = min(start_idx + chunk_size, self.n_events)
                
-                    # Load phi chunk
-                    phi_data_raw = []
-                    for name in self.PHI_HDF5_ORDER:
-                        phi_data_raw.append(phi_group[name][start_idx:end_idx])
-                    phi_chunk_raw = np.array(phi_data_raw, dtype=np.float32).T
-                    
-                    # Normalize phi
-                    phi_chunk_normalized = self._normalize_phi(phi_chunk_raw)
-                    
-                    # Load target chunk
-                    target_data = []
-                    for key in self.voxel_keys:
-                        target_data.append(target_group[key][start_idx:end_idx])
-                    target_chunk_raw = np.array(target_data, dtype=np.float32).T
-                    
-                    # Load region targets FIRST (needed for voxel normalization)
-                    region_data = []
-                    for key in self.region_keys:
-                        region_data.append(target_regions_group[key][start_idx:end_idx])
-                    region_chunk_raw = np.array(region_data, dtype=np.float32).T
-                    
-                    # Normalize target (requires region_chunk_raw)
-                    target_chunk_normalized = self._normalize_target(target_chunk_raw, region_chunk_raw)
-                    region_chunk_normalized = self._normalize_region_targets(region_chunk_raw)
-                    
-                    # Split voxels into 4 regions
-                    voxel_regions = self._split_voxels_to_regions(target_chunk_normalized)
-                    
-                    # Yield single samples (CaloScore format)
-                    for i in range(phi_chunk_normalized.shape[0]):
-                        yield (
-                            {
-                                'PIT': voxel_regions[0][i],
-                                'BOT': voxel_regions[1][i],
-                                'WALL': voxel_regions[2][i],
-                                'TOP': voxel_regions[3][i]
-                            },  # List of 4 region grids
-                            region_chunk_normalized[i],    # area_hits
-                            phi_chunk_normalized[i]        # cond
-                        )
+                # Load phi chunk
+                phi_data_raw = []
+                for name in self.PHI_HDF5_ORDER:
+                    phi_data_raw.append(phi_group[name][start_idx:end_idx])
+                phi_chunk_raw = np.array(phi_data_raw, dtype=np.float32).T
+                
+                # Normalize phi
+                phi_chunk_normalized = self._normalize_phi(phi_chunk_raw)
+                
+                # Load target chunk
+                target_data = []
+                for key in self.voxel_keys:
+                    target_data.append(target_group[key][start_idx:end_idx])
+                target_chunk_raw = np.array(target_data, dtype=np.float32).T
+                
+                # Load region targets FIRST (needed for voxel normalization)
+                region_data = []
+                for key in self.region_keys:
+                    region_data.append(target_regions_group[key][start_idx:end_idx])
+                region_chunk_raw = np.array(region_data, dtype=np.float32).T
+                
+                # Normalize target (requires region_chunk_raw)
+                target_chunk_normalized = self._normalize_target(target_chunk_raw, region_chunk_raw)
+                region_chunk_normalized = self._normalize_region_targets(region_chunk_raw)
+                
+                # Split voxels into 4 regions
+                voxel_regions = self._split_voxels_to_regions(target_chunk_normalized)
+                
+                # Yield single samples (CaloScore format)
+                for i in range(phi_chunk_normalized.shape[0]):
+                    yield (
+                        {
+                            'PIT': voxel_regions[0][i],
+                            'BOT': voxel_regions[1][i],
+                            'WALL': voxel_regions[2][i],
+                            'TOP': voxel_regions[3][i]
+                        },  # List of 4 region grids
+                        region_chunk_normalized[i],    # area_hits
+                        phi_chunk_normalized[i]        # cond
+                    )
     
     def _normalize_phi(self, phi_raw: np.ndarray) -> np.ndarray:
         """
