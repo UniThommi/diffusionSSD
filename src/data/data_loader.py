@@ -1,8 +1,23 @@
+# data_loader.py
 import h5py
 import tensorflow as tf
 import numpy as np
+import toml
+import json
+from pathlib import Path
 
 class voxelDataset:
+    """
+    NC-Score Dataset Loader
+    
+    Loads neutron capture events from HDF5 with:
+    - Phi parameters (physics conditioning)
+    - Region targets (4 areas: pit, bot, wall, top)
+    - Voxel targets (9583 individual PMT responses)
+    
+    Handles normalization and One-Hot encoding based on data_config.toml
+    """
+    
     # HDF5 Spaltenreihenfolge (vollständig)
     PHI_HDF5_ORDER = [
         "xNC_mm", "yNC_mm", "zNC_mm", "matID", "volID", "#gamma", "E_gamma_tot_keV",
@@ -13,27 +28,35 @@ class voxelDataset:
         "gammaE3_keV", "gammapx3", "gammapy3", "gammapz3",
         "gammaE4_keV", "gammapx4", "gammapy4", "gammapz4"
     ]
+
+    @staticmethod
+    def _get_random_indices(total_events, max_events, seed=42):
+        """Generate random indices for subset selection"""
+        if max_events is None or max_events >= total_events:
+            return None  # Use all events
     
-    def __init__(self, h5_path: str, config_path: str = None):
+        np.random.seed(seed)
+        indices = np.random.choice(total_events, size=max_events, replace=False)
+        return np.sort(indices)  # Sort for efficient HDF5 access
+    
+    def __init__(self, h5_path: str, config: dict):
         """
-        Initialize dataset with normalization and One-Hot encoding from config
+        Initialize dataset for CaloScore-compatible output
         
         Args:
             h5_path: Path to HDF5 file
-            config_path: Path to config.toml (if None, auto-detect)
+            config: Full config dict from config.toml
         """
-        from config.config_loader import ConfigLoader
-        from data.volume_groups import VolumeGrouper
-        import json
-        
         self.h5_path = h5_path
+        self.config = config
         
-        # Load config
-        cfg_loader = ConfigLoader(config_path)
-        self.feature_config = cfg_loader.get_feature_config()
-        self.norm_config = cfg_loader.get_normalization_config()
-        self.mapping_config = cfg_loader.get_mapping_config()
-        self.onehot_config = cfg_loader.get_onehot_config()
+        # Extract sub-configs
+        self.feature_config = config['features']
+        self.norm_config = config['normalization']
+        self.mapping_config = config['mapping']
+        self.onehot_config = config['onehot']
+        self.region_config = config['regions']
+        self.model_config = config['model']
         
         # Active features
         self.active_phi_raw = self.feature_config['active_phi'].copy()
@@ -56,7 +79,6 @@ class voxelDataset:
         print(f"  Loaded {self.n_materials} materials")
         
         if self.enable_material_onehot:
-            # Build material index
             self.material_names = sorted(set(self.material_mapping.values()))
             self.material_to_idx = {name: idx for idx, name in enumerate(self.material_names)}
             self.n_material_categories = len(self.material_names)
@@ -65,39 +87,38 @@ class voxelDataset:
         else:
             self.n_material_categories = 0
         
-        # Load volume mapping
-        print("\n[Volume Mapping]")
-        with open(self.mapping_config['volume_mapping_file'], 'r') as f:
-            volume_mapping_raw = json.load(f)
-        
-        # Invert: {name: id} → {id: name}
-        self.volume_mapping = {}
-        for vol_name, vol_id in volume_mapping_raw.items():
-            if isinstance(vol_id, int):
-                # Handle empty string as "noVolume"
-                final_name = "noVolume" if vol_name == "" else vol_name
-                self.volume_mapping[vol_id] = final_name
-        print(f"  Loaded {len(self.volume_mapping):,} volumes")
-        
+        # Load volume mapping (only if enabled)
         if self.enable_volume_onehot:
+            print("\n[Volume Mapping]")
+            with open(self.mapping_config['volume_mapping_file'], 'r') as f:
+                volume_mapping_raw = json.load(f)
+            
+            # Invert: {name: id} → {id: name}
+            self.volume_mapping = {}
+            for vol_name, vol_id in volume_mapping_raw.items():
+                if isinstance(vol_id, int):
+                    final_name = "noVolume" if vol_name == "" else vol_name
+                    self.volume_mapping[vol_id] = final_name
+            print(f"  Loaded {len(self.volume_mapping):,} volumes")
+            
             # Initialize volume grouper
+            from src.data.volume_groups import VolumeGrouper
             self.volume_grouper = VolumeGrouper()
             print(f"  Defined groups: {self.volume_grouper.n_groups}")
             
-            # Build lookup (validiert alle Volumes)
+            # Build lookup
             print("  Building volume group lookup...")
             try:
                 self.volume_to_group, self.volume_group_contents = \
                     self.volume_grouper.build_lookup_dict(self.volume_mapping)
                 
-                # Count non-empty groups
                 non_empty = sum(1 for v in self.volume_group_contents.values() if len(v) > 0)
                 print(f"  ✓ All volumes matched successfully")
                 print(f"  Active groups: {non_empty}/{self.volume_grouper.n_groups}")
                 
                 self.n_volume_categories = self.volume_grouper.n_groups
                 
-                # Save group mapping to JSON (überschreibt bei jedem Run)
+                # Save mapping
                 output_path = Path("./data/volume_group_mapping.json")
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 
@@ -118,12 +139,12 @@ class voxelDataset:
                 
             except ValueError as e:
                 raise RuntimeError(
-                    f"VOLUME GROUPING FAILED\n"
-                    f"{e}\n"
+                    f"VOLUME GROUPING FAILED\n{e}\n"
                     f"Training aborted before any computation."
                 )
         else:
             self.n_volume_categories = 0
+            print("\n[Volume Mapping] DISABLED - Skipped")
         
         # Adjust active_phi: Remove matID/volID if One-Hot enabled
         self.active_phi = [
@@ -141,16 +162,81 @@ class voxelDataset:
         with h5py.File(h5_path, "r") as f:
             if "phi" not in f or "target" not in f:
                 raise ValueError("HDF5 must contain 'target' and 'phi' groups")
-            self.n_events = f["phi"]["#gamma"].shape[0]
+            total_events = f["phi"]["#gamma"].shape[0]
+            max_events = config['training'].get('max_events', None)
+            shuffle = config['training'].get('shuffle_before_limit', False)
+            # Generate subset indices if needed
+            if max_events is not None and max_events < total_events:
+                if shuffle:
+                    self.event_indices = self._get_random_indices(total_events, max_events)
+                    print(f"  [SUBSET] Using {max_events:,} random events from {total_events:,}")
+                else:
+                    self.event_indices = np.arange(max_events)
+                    print(f"  [SUBSET] Using first {max_events:,} events from {total_events:,}")
+                self.n_events = max_events
+            else:
+                self.event_indices = None
+                self.n_events = total_events
+                print(f"  [FULL DATASET] Using all {total_events:,} events")
+            
             self.voxel_keys = list(f["target"].keys())
             
             # Check if region targets exist
             self.has_region_targets = "target_regions" in f
             if self.has_region_targets:
                 self.region_keys = list(f["target_regions"].keys())
+            else:
+                raise ValueError("HDF5 must contain 'target_regions' group for NC-Score training!")
             
             # Check if voxel_metadata exists
             self.has_voxel_metadata = "voxel_metadata" in f
+        
+        # Load grid shapes from config
+        self.grid_shapes = {
+            'PIT': tuple(config['SHAPE_PIT']),    # Nutzt uppercase aus train.py
+            'BOT': tuple(config['SHAPE_BOT']),
+            'WALL': tuple(config['SHAPE_WALL']),
+            'TOP': tuple(config['SHAPE_TOP'])
+        }
+        
+        # Build voxel-to-region mapping (once, for efficiency)
+        print("\n[Voxel-to-Region Mapping]")
+        self.voxel_to_region_idx = np.zeros(len(self.voxel_keys), dtype=np.int32)
+        self.region_voxel_indices = {'PIT': [], 'BOT': [], 'WALL': [], 'TOP': []}
+        
+        for voxel_idx, voxel_key in enumerate(self.voxel_keys):
+            if voxel_key.startswith(self.region_config['pit_prefix']):
+                region = 'PIT'
+                region_idx = 0
+            elif voxel_key.startswith(self.region_config['bot_prefix']):
+                region = 'BOT'
+                region_idx = 1
+            elif voxel_key.startswith(self.region_config['top_prefix']):
+                region = 'TOP'
+                region_idx = 3
+            else:
+                region = 'WALL'
+                region_idx = 2
+            
+            self.voxel_to_region_idx[voxel_idx] = region_idx
+            self.region_voxel_indices[region].append(voxel_idx)
+        
+        # Convert to numpy arrays
+        for region in self.region_voxel_indices:
+            self.region_voxel_indices[region] = np.array(
+                self.region_voxel_indices[region], dtype=np.int32
+            )
+        
+        # Validate voxel counts
+        expected = self.region_config['expected_voxel_counts']
+        for region, indices in self.region_voxel_indices.items():
+            actual = len(indices)
+            exp = expected[region]
+            if actual != exp:
+                raise ValueError(
+                    f"Region {region}: Expected {exp} voxels, found {actual}"
+                )
+            print(f"  {region.upper()}: {actual} voxels → Grid {self.grid_shapes[region]}")
         
         # Calculate phi_dim
         base_dim = len(self.active_phi)
@@ -167,82 +253,156 @@ class voxelDataset:
             print(f"  + Volume One-Hot: {self.n_volume_categories}")
         print(f"  = Total phi_dim: {self.phi_dim}")
         print(f"  Target voxels: {self.target_dim}")
-        print(f"  Region targets: {self.has_region_targets}")
-        print(f"  Voxel metadata: {self.has_voxel_metadata}")
+        print(f"  Region targets: {'✓' if self.has_region_targets else '✗'}")
+        print(f"  Voxel metadata: {'✓' if self.has_voxel_metadata else '✗'}")
 
-    def _generator_chunked(self, chunk_size):
-        """Memory-efficient generator with normalization"""
+    def _split_voxels_to_regions(self, voxel_batch: np.ndarray) -> list:
+        """
+        Split voxel array into 4 region arrays and reshape to grids
+        
+        Args:
+            voxel_batch: (batch, 9583) - All voxels
+        
+        Returns:
+            List of 4 tensors: [(batch, *shape_pit), (batch, *shape_bot), 
+                                (batch, *shape_wall), (batch, *shape_top)]
+        """
+        batch_size = voxel_batch.shape[0]
+        region_batches = []
+        
+        for region_name in ['PIT', 'BOT', 'WALL', 'TOP']:
+            indices = self.region_voxel_indices[region_name]
+            region_voxels = voxel_batch[:, indices]  # (batch, n_voxels_region)
+            
+            # PLACEHOLDER: Reshape to grid (TODO: Real voxel geometry mapping)
+            grid_shape = self.grid_shapes[region_name]
+            n_voxels = len(indices)
+            grid_size = np.prod(grid_shape[:-1])  # Exclude channel dimension
+            
+            if n_voxels != grid_size:
+                # Pad or truncate to fit grid (TEMPORARY!)
+                if n_voxels < grid_size:
+                    # Pad with zeros
+                    pad_width = ((0, 0), (0, grid_size - n_voxels))
+                    region_voxels = np.pad(region_voxels, pad_width, mode='constant')
+                else:
+                    # Truncate (should not happen with correct grid shapes)
+                    region_voxels = region_voxels[:, :grid_size]
+            
+            # Reshape to grid
+            target_shape = (batch_size,) + grid_shape
+            region_grid = region_voxels.reshape(target_shape)
+            region_batches.append(region_grid)
+        
+        return region_batches
+
+    def _generator_chunked(self, chunk_size, rank=0, size=1):
+        """Memory-efficient generator with CaloScore-compatible output"""
         import warnings
         
         with h5py.File(self.h5_path, "r") as f:
             phi_group = f["phi"]
             target_group = f["target"]
-            
-            if self.has_region_targets:
-                target_regions_group = f["target_regions"]
-            
-            if self.has_voxel_metadata:
-                voxel_metadata_group = f["voxel_metadata"]
+            target_regions_group = f["target_regions"]
             
             # Process in chunks
-            for start_idx in range(0, self.n_events, chunk_size):
-                end_idx = min(start_idx + chunk_size, self.n_events)
-                
-                # Load phi chunk (alle HDF5 Spalten)
-                phi_data_raw = []
-                for name in self.PHI_HDF5_ORDER:
-                    phi_data_raw.append(phi_group[name][start_idx:end_idx])
-                phi_chunk_raw = np.array(phi_data_raw, dtype=np.float32).T  # (chunk_size, 30)
-                
-                # Normalize phi
-                phi_chunk_normalized = self._normalize_phi(phi_chunk_raw)
-                
-                # Load target chunk
-                target_data = []
-                for key in self.voxel_keys:
-                    target_data.append(target_group[key][start_idx:end_idx])
-                target_chunk_raw = np.array(target_data, dtype=np.float32).T
-                
-                # Normalize target
-                target_chunk_normalized = self._normalize_target(target_chunk_raw)
-                
-                # Load region targets (optional)
-                if self.has_region_targets:
+            # Determine iteration range
+            if self.event_indices is not None:
+                # Subset mode: iterate over selected indices
+                total_indices = len(self.event_indices)
+                for chunk_start in range(rank, total_indices, chunk_size * size):
+                    chunk_end = min(chunk_start + chunk_size, total_indices)
+                    # Get actual HDF5 indices for this chunk
+                    indices_chunk = self.event_indices[chunk_start:chunk_end]
+                    
+                    # Load data using fancy indexing
+                    phi_data_raw = []
+                    for name in self.PHI_HDF5_ORDER:
+                        phi_data_raw.append(phi_group[name][indices_chunk])
+                    phi_chunk_raw = np.array(phi_data_raw, dtype=np.float32).T
+                    
+                    target_data = []
+                    for key in self.voxel_keys:
+                        target_data.append(target_group[key][indices_chunk])
+                    target_chunk_raw = np.array(target_data, dtype=np.float32).T
+                    
+                    region_data = []
+                    for key in self.region_keys:
+                        region_data.append(target_regions_group[key][indices_chunk])
+                    region_chunk_raw = np.array(region_data, dtype=np.float32).T
+                    
+                    # Continue with normalization...
+                    phi_chunk_normalized = self._normalize_phi(phi_chunk_raw)
+                    target_chunk_normalized = self._normalize_target(target_chunk_raw, region_chunk_raw)
+                    region_chunk_normalized = self._normalize_region_targets(region_chunk_raw)
+                    voxel_regions = self._split_voxels_to_regions(target_chunk_normalized)
+                    
+                    for i in range(phi_chunk_normalized.shape[0]):
+                        yield (
+                            {
+                                'PIT': voxel_regions[0][i],
+                                'BOT': voxel_regions[1][i],
+                                'WALL': voxel_regions[2][i],
+                                'TOP': voxel_regions[3][i]
+                            },
+                            region_chunk_normalized[i],
+                            phi_chunk_normalized[i]
+                        )
+            else:
+                # Full dataset mode: sequential access
+                for start_idx in range(rank, self.n_events, chunk_size * size):
+                    end_idx = min(start_idx + chunk_size, self.n_events)
+               
+                    # Load phi chunk
+                    phi_data_raw = []
+                    for name in self.PHI_HDF5_ORDER:
+                        phi_data_raw.append(phi_group[name][start_idx:end_idx])
+                    phi_chunk_raw = np.array(phi_data_raw, dtype=np.float32).T
+                    
+                    # Normalize phi
+                    phi_chunk_normalized = self._normalize_phi(phi_chunk_raw)
+                    
+                    # Load target chunk
+                    target_data = []
+                    for key in self.voxel_keys:
+                        target_data.append(target_group[key][start_idx:end_idx])
+                    target_chunk_raw = np.array(target_data, dtype=np.float32).T
+                    
+                    # Load region targets FIRST (needed for voxel normalization)
                     region_data = []
                     for key in self.region_keys:
                         region_data.append(target_regions_group[key][start_idx:end_idx])
                     region_chunk_raw = np.array(region_data, dtype=np.float32).T
+                    
+                    # Normalize target (requires region_chunk_raw)
+                    target_chunk_normalized = self._normalize_target(target_chunk_raw, region_chunk_raw)
                     region_chunk_normalized = self._normalize_region_targets(region_chunk_raw)
-                else:
-                    region_chunk_normalized = None
-                
-                # Load voxel metadata (optional)
-                if self.has_voxel_metadata:
-                    # TODO: Implement voxel_metadata normalization
-                    # One-Hot für regions + normierte r, phi, z
-                    pass
-                
-                # Yield einzelne Samples
-                for i in range(phi_chunk_normalized.shape[0]):
-                    sample = {
-                        'phi': phi_chunk_normalized[i],
-                        'target': target_chunk_normalized[i]
-                    }
                     
-                    if region_chunk_normalized is not None:
-                        sample['target_regions'] = region_chunk_normalized[i]
+                    # Split voxels into 4 regions
+                    voxel_regions = self._split_voxels_to_regions(target_chunk_normalized)
                     
-                    yield sample
+                    # Yield single samples (CaloScore format)
+                    for i in range(phi_chunk_normalized.shape[0]):
+                        yield (
+                            {
+                                'PIT': voxel_regions[0][i],
+                                'BOT': voxel_regions[1][i],
+                                'WALL': voxel_regions[2][i],
+                                'TOP': voxel_regions[3][i]
+                            },  # List of 4 region grids
+                            region_chunk_normalized[i],    # area_hits
+                            phi_chunk_normalized[i]        # cond
+                        )
     
     def _normalize_phi(self, phi_raw: np.ndarray) -> np.ndarray:
         """
         Normalize phi parameters according to config
         
         Args:
-            phi_raw: (batch, 30) - alle HDF5 Spalten in PHI_HDF5_ORDER
+            phi_raw: (batch, 30) - all HDF5 columns in PHI_HDF5_ORDER
         
         Returns:
-            phi_normalized: (batch, phi_dim) - nur active features, normiert
+            phi_normalized: (batch, phi_dim) - only active features, normalized
         """
         import warnings
         
@@ -258,17 +418,18 @@ class voxelDataset:
         z_max = self.norm_config['z_max']
         h_cyl = z_max - z_min
         angle_max = self.norm_config['angle_max']
+        gamma_count_max = self.norm_config['gamma_count_max']
         
-        # Normierte Features (in Reihenfolge von active_phi)
+        # Normalized features
         phi_normalized = []
         
         for feature_name in self.active_phi:
             if feature_name not in phi_dict:
-                raise ValueError(f"Feature '{feature_name}' nicht in HDF5 gefunden!")
+                raise ValueError(f"Feature '{feature_name}' not in HDF5!")
             
             raw_values = phi_dict[feature_name]
             
-            # === ENERGIE-NORMIERUNG (alle auf E_max) ===
+            # === ENERGY NORMALIZATION ===
             if feature_name in ['E_gamma_tot_keV', 'gammaE1_keV', 'gammaE2_keV', 
                                'gammaE3_keV', 'gammaE4_keV']:
                 normalized = raw_values / E_max
@@ -279,29 +440,27 @@ class voxelDataset:
                         f"NORMALIZATION OVERFLOW: {feature_name}\n"
                         f"  Max value: {max_val:.2f} keV\n"
                         f"  Norm factor: {E_max:.2f} keV\n"
-                        f"  → Update config.toml: normalization.E_max = {np.ceil(max_val)}"
+                        f"  → Update data_config.toml: normalization.E_max = {np.ceil(max_val)}"
                     )
             
-            # === IMPULSE (bereits normiert, keine Änderung) ===
+            # === MOMENTUM (already normalized) ===
             elif feature_name in ['gammapx1', 'gammapx2', 'gammapx3', 'gammapx4',
                                  'gammapy1', 'gammapy2', 'gammapy3', 'gammapy4',
                                  'gammapz1', 'gammapz2', 'gammapz3', 'gammapz4',
                                  'p_mean_r', 'p_mean_z']:
-                normalized = raw_values  # Bereits normiert
+                normalized = raw_values
             
-            # === RADIEN (auf r_cylinder) ===
+            # === RADII ===
             elif feature_name in ['r_NC_mm', 'dist_to_wall_mm']:
                 normalized = raw_values / r_cyl
-                # Kann negativ sein (NC außerhalb) - erlaubt, keine Warnung
             
-            # === Z-KOORDINATEN (auf Zylinderhöhe) ===
+            # === Z-COORDINATES ===
             elif feature_name in ['zNC_mm', 'dist_to_bot_mm', 'dist_to_top_mm']:
                 normalized = (raw_values - z_min) / h_cyl
-                # Kann außerhalb [0,1] sein - erlaubt für NC, keine Warnung
             
-            # === X, Y (falls aktiviert - standardmäßig nicht) ===
+            # === X, Y (if activated) ===
             elif feature_name in ['xNC_mm', 'yNC_mm']:
-                normalized = (raw_values + r_cyl) / (2 * r_cyl)  # [-r, r] -> [0, 1]
+                normalized = (raw_values + r_cyl) / (2 * r_cyl)
                 
                 if np.any((normalized < 0) | (normalized > 1)):
                     warnings.warn(
@@ -309,28 +468,25 @@ class voxelDataset:
                         f"  Range: [{np.min(raw_values):.1f}, {np.max(raw_values):.1f}]"
                     )
             
-            # === WINKEL (auf 2π) ===
+            # === ANGLE ===
             elif feature_name == 'phi_NC_rad':
-                # Bereits in [0, 2π] oder [-π, π]?
-                # Normiere auf [0, 1]
                 normalized = np.mod(raw_values, angle_max) / angle_max
             
-            # === GAMMA-ANZAHL ===
+            # === GAMMA COUNT ===
             elif feature_name == '#gamma':
-                # Diskret {0, 1, 2, 3, 4} -> normiere auf [0, 1]
-                normalized = raw_values / 4.0
+                normalized = raw_values / gamma_count_max
             
-            # KATEGORIALE (matID, volID, FALLBACK falls kein one hot encoding)
+            # === CATEGORICAL (fallback if no One-Hot) ===
             elif feature_name in ['matID', 'volID']:
-                normalized = raw_values 
+                normalized = raw_values
             
             else:
-                raise ValueError(f"Unbekanntes Feature: {feature_name}")
+                raise ValueError(f"Unknown feature: {feature_name}")
             
-            phi_normalized.append(normalized)        
-
+            phi_normalized.append(normalized)
+        
         # Stack base features
-        phi_base = np.stack(phi_normalized, axis=1)  # (batch, base_dim)
+        phi_base = np.stack(phi_normalized, axis=1)
         
         # === ONE-HOT ENCODING ===
         onehot_features = []
@@ -347,10 +503,7 @@ class voxelDataset:
                     mat_idx = self.material_to_idx[mat_name]
                     material_onehot[i, mat_idx] = 1.0
                 else:
-                    raise RuntimeError(
-                        f"Unknown matID: {mat_id}\n"
-                        f"Available materials: {list(self.material_mapping.keys())}"
-                    )
+                    raise RuntimeError(f"Unknown matID: {mat_id}")
             
             onehot_features.append(material_onehot)
         
@@ -365,16 +518,12 @@ class voxelDataset:
                     vol_group_idx = self.volume_to_group[vol_id]
                     volume_onehot[i, vol_group_idx] = 1.0
                 else:
-                    # Should never happen (validated in __init__)
                     vol_name = self.volume_mapping.get(vol_id, f"UNKNOWN_{vol_id}")
-                    raise RuntimeError(
-                        f"Unknown volID: {vol_id} ('{vol_name}')\n"
-                        f"This should have been caught during initialization!"
-                    )
+                    raise RuntimeError(f"Unknown volID: {vol_id} ('{vol_name}')")
             
             onehot_features.append(volume_onehot)
         
-        # Concatenate all features
+        # Concatenate
         if onehot_features:
             phi_normalized = np.concatenate([phi_base] + onehot_features, axis=1)
         else:
@@ -382,34 +531,56 @@ class voxelDataset:
         
         return phi_normalized.astype(np.float32)
     
-    def _normalize_target(self, target_raw: np.ndarray) -> np.ndarray:
+    def _normalize_target(self, target_raw: np.ndarray, region_raw: np.ndarray) -> np.ndarray:
         """
-        Normalize voxel hit counts
+        Normalize voxel hit counts to corresponding area hits (like CaloScore)
         
         Args:
-            target_raw: (batch, n_voxels)
+            target_raw: (batch, n_voxels) - Raw voxel hits
+            region_raw: (batch, 4) - Raw region hits [pit, bot, wall, top]
         
         Returns:
-            target_normalized: (batch, n_voxels)
+            target_normalized: (batch, n_voxels) - Normalized as fraction of area
         """
-        voxel_hit_max = self.norm_config['voxel_hit_max']
+        batch_size = target_raw.shape[0]
+        n_voxels = target_raw.shape[1]
         
-        normalized = target_raw / voxel_hit_max
+        # Get voxel keys to determine which region each voxel belongs to
+        # Voxel keys format: "000013", "010045", "990123", "123456"
+        # Prefix: 00=pit, 01=bot, 99=top, other=wall
         
-        if np.any(normalized > 1.0):
-            max_val = np.max(target_raw)
-            raise RuntimeError(
-                f"NORMALIZATION OVERFLOW: Voxel Hits\n"
-                f"  Max value: {max_val:.1f}\n"
-                f"  Norm factor: {voxel_hit_max:.1f}\n"
-                f"  → Update config.toml: normalization.voxel_hit_max = {np.ceil(max_val)}"
-            )
+        # Build region assignment for each voxel (done once in init would be better, but ok here)
+        voxel_to_region = np.zeros(n_voxels, dtype=np.int32)  # 0=pit, 1=bot, 2=wall, 3=top
         
-        return normalized.astype(np.float32)
+        for voxel_idx, voxel_key in enumerate(self.voxel_keys):
+            if voxel_key.startswith(self.region_config['pit_prefix']):
+                voxel_to_region[voxel_idx] = 0  # pit
+            elif voxel_key.startswith(self.region_config['bot_prefix']):
+                voxel_to_region[voxel_idx] = 1  # bot
+            elif voxel_key.startswith(self.region_config['top_prefix']):
+                voxel_to_region[voxel_idx] = 3  # top
+            else:
+                voxel_to_region[voxel_idx] = 2  # wall
+        
+        # Normalize each voxel by its area's total hits
+        target_normalized = np.zeros_like(target_raw, dtype=np.float32)
+        
+        for batch_idx in range(batch_size):
+            for voxel_idx in range(n_voxels):
+                region_idx = voxel_to_region[voxel_idx]
+                area_hits = region_raw[batch_idx, region_idx]
+                
+                if area_hits > 0:
+                    target_normalized[batch_idx, voxel_idx] = target_raw[batch_idx, voxel_idx] / area_hits
+                else:
+                    target_normalized[batch_idx, voxel_idx] = 0.0
+        
+        return target_normalized
     
     def _normalize_region_targets(self, region_raw: np.ndarray) -> np.ndarray:
         """
         Normalize region hit counts with area correction (Strategy C)
+        FIXED normalization to max_hit_global (like CaloScore layer energies)
         
         Args:
             region_raw: (batch, 4) - [pit, bot, wall, top]
@@ -417,218 +588,84 @@ class voxelDataset:
         Returns:
             region_normalized: (batch, 4)
         """
-        area_ratios = self.norm_config['area_ratios']
-        max_hit_global = self.norm_config['region_hit_max_global']
+        voxel_hit_max = self.norm_config['voxel_hit_max']
         
-        # Area ratios in order [pit, bot, wall, top]
-        ratios = np.array([
-            area_ratios['pit'],
-            area_ratios['bot'],
-            area_ratios['wall'],
-            area_ratios['top']
-        ], dtype=np.float32)
-        
-        # Area-corrected densities
-        densities = region_raw / ratios  # (batch, 4) / (4,) -> (batch, 4)
-        
-        # Normalize to global max
-        normalized = densities / max_hit_global
+        normalized = region_raw / voxel_hit_max
         
         if np.any(normalized > 1.0):
-            max_density = np.max(densities)
-            max_region_idx = np.argmax(np.max(densities, axis=0))
-            region_names = ['pit', 'bot', 'wall', 'top']
-            
+            max_val = np.max(region_raw)
             raise RuntimeError(
-                f"NORMALIZATION OVERFLOW: Region Hits ({region_names[max_region_idx]})\n"
-                f"  Max density (area-corrected): {max_density:.1f}\n"
-                f"  Norm factor: {max_hit_global:.1f}\n"
-                f"  → Update config.toml: normalization.region_hits.max_hit_global = {np.ceil(max_density)}"
+                f"NORMALIZATION OVERFLOW: Voxel Hits\n"
+                f"  Max value: {max_val:.1f}\n"
+                f"  Norm factor: {voxel_hit_max:.1f}\n"
+                f"  → Update data_config.toml: normalization.voxel_hit_max = {np.ceil(max_val)}"
             )
         
         return normalized.astype(np.float32)
 
-    def get_base_dataset(self, shuffle: bool=True):
-        """Basis Dataset mit Normierung"""
-        # Output signature mit dict
-        output_signature = {
-            'phi': tf.TensorSpec(shape=(self.phi_dim,), dtype=tf.float32),
-            'target': tf.TensorSpec(shape=(self.target_dim,), dtype=tf.float32)
-        }
+    def get_dataset(self, shuffle=True, rank=0, size=1):
+        """
+        Create clean dataset for CaloScore training (no noise injection)
         
-        # Add region targets if available
-        if self.has_region_targets:
-            output_signature['target_regions'] = tf.TensorSpec(shape=(4,), dtype=tf.float32)
+        Args:
+            shuffle: Shuffle data
+        
+        Returns:
+            tf.data.Dataset yielding (voxel_areas_list, area_hits, cond)
+        """
+        # Define output signature (CaloScore compatible)
+        output_signature = (
+            {  # ← Dictionary von TensorSpecs
+                'PIT': tf.TensorSpec(shape=self.grid_shapes['PIT'], dtype=tf.float32),
+                'BOT': tf.TensorSpec(shape=self.grid_shapes['BOT'], dtype=tf.float32),
+                'WALL': tf.TensorSpec(shape=self.grid_shapes['WALL'], dtype=tf.float32),
+                'TOP': tf.TensorSpec(shape=self.grid_shapes['TOP'], dtype=tf.float32)
+            },
+            tf.TensorSpec(shape=(4,), dtype=tf.float32),
+            tf.TensorSpec(shape=(self.phi_dim,), dtype=tf.float32)
+        )
         
         def generator():
-            for sample in self._generator_chunked(chunk_size=1000):
-                if self.has_region_targets:
-                    yield (sample['phi'], sample['target'], sample['target_regions'])
-                else:
-                    yield (sample['phi'], sample['target'])
+            for sample in self._generator_chunked(chunk_size=1000, rank=rank, size=size):
+                yield sample
         
-        # Create dataset
-        if self.has_region_targets:
-            ds = tf.data.Dataset.from_generator(
-                generator,
-                output_signature=(
-                    output_signature['phi'],
-                    output_signature['target'],
-                    output_signature['target_regions']
-                )
-            )
-        else:
-            ds = tf.data.Dataset.from_generator(
-                generator,
-                output_signature=(
-                    output_signature['phi'],
-                    output_signature['target']
-                )
-            )
+        ds = tf.data.Dataset.from_generator(
+            generator,
+            output_signature=output_signature
+        )
         
         if shuffle:
             ds = ds.shuffle(buffer_size=min(5000, self.n_events))
         
-        return ds    
+        return ds
     
-    def get_noisy_dataset(self, batch_size: int = 32, diffusion_schedule: dict = None, 
-                         shuffle: bool = True):
+    def denormalize_predictions(self, voxels_normalized, areas_normalized):
         """
-        Erstelle noisy dataset für Diffusion Training
+        Reverse normalization after model inference
         
         Args:
-            batch_size: Training batch size
-            diffusion_schedule: Dict mit 'T' und 'alphas_cumprod' aus config
-            shuffle: Shuffle data
+            voxels_normalized: List of 4 region grids (normalized)
+            areas_normalized: (batch, 4) - normalized area hits
+        
+        Returns:
+            voxels_raw, areas_raw - in original hit counts
         """
-        if diffusion_schedule is None:
-            raise ValueError(
-                "Must provide diffusion_schedule from config!\n"
-                "Usage: config = ConfigLoader(); schedule = config.diffusion_schedule.to_dict()"
-            )
+        # 1. Denormalize areas
+        area_ratios = np.array([
+            self.norm_config['area_ratios']['pit'],
+            self.norm_config['area_ratios']['bot'],
+            self.norm_config['area_ratios']['wall'],
+            self.norm_config['area_ratios']['top']
+        ])
         
-        T = diffusion_schedule['T']
-        alphas_cumprod = diffusion_schedule['alphas_cumprod']
+        areas_raw = areas_normalized * self.norm_config['region_hit_max_global'] * area_ratios
         
-        base = self.get_base_dataset(shuffle=shuffle)
-
-        if self.has_region_targets:
-            def _add_noise(phi, target, target_regions):
-                t = tf.random.uniform([], minval=0, maxval=T, dtype=tf.int32)
-                alpha_t = tf.gather(alphas_cumprod, t)
-                sqrt_alpha = tf.sqrt(alpha_t)
-                sqrt_one_minus = tf.sqrt(1.0 - alpha_t)
-                noise = tf.random.normal(shape=tf.shape(target), dtype=tf.float32)
-                x_noisy = sqrt_alpha * target + sqrt_one_minus * noise
-                return phi, x_noisy, noise, t, target_regions
-            
-            return (base
-                    .map(_add_noise, num_parallel_calls=tf.data.AUTOTUNE)
-                    .batch(batch_size)
-                    .prefetch(tf.data.AUTOTUNE))
-        else:
-            def _add_noise(phi, target):
-                t = tf.random.uniform([], minval=0, maxval=T, dtype=tf.int32)
-                alpha_t = tf.gather(alphas_cumprod, t)
-                sqrt_alpha = tf.sqrt(alpha_t)
-                sqrt_one_minus = tf.sqrt(1.0 - alpha_t)
-                noise = tf.random.normal(shape=tf.shape(target), dtype=tf.float32)
-                x_noisy = sqrt_alpha * target + sqrt_one_minus * noise
-                return phi, x_noisy, noise, t
-
-            return (base
-                    .map(_add_noise, num_parallel_calls=tf.data.AUTOTUNE)
-                    .batch(batch_size)
-                    .prefetch(tf.data.AUTOTUNE))
-    
-    # Für Debugging
-    def get_small_test_dataset(self, batch_size: int=8, num_samples: int=100): 
-        """Kleines Test-Dataset für Memory-Tests"""
-        base = self.get_base_dataset(shuffle=False, use_chunking=True)
+        # 2. Denormalize voxels (multiply by area hits)
+        voxels_raw = []
+        for region_idx, region_name in enumerate(['pit', 'bot', 'wall', 'top']):
+            voxel_grid = voxels_normalized[region_idx]  # (batch, *grid_shape)
+            area_hits = areas_raw[:, region_idx:region_idx+1, None, None, None]  # Broadcasting shape
+            voxel_raw = voxel_grid * area_hits
+            voxels_raw.append(voxel_raw)
         
-        def _add_noise(phi, target):
-            t = tf.random.uniform([], minval=0, maxval=self.T, dtype=tf.int32)
-            alpha_t = tf.gather(self.alphas_cumprod, t)
-            sqrt_alpha = tf.sqrt(alpha_t)
-            sqrt_one_minus = tf.sqrt(1.0 - alpha_t)
-            noise = tf.random.normal(shape=tf.shape(target), dtype=tf.float32)
-            x_noisy = sqrt_alpha * target + sqrt_one_minus * noise
-            return phi, x_noisy, noise, t
-        
-        return (base
-                .take(num_samples)
-                .map(_add_noise)
-                .batch(batch_size)
-                .prefetch(1))
-
-    # Testing 
-    def check_memory_usage(self):
-        """Memory-Usage Check"""
-        print(f"Dataset Info:")
-        print(f"  Events: {self.n_events:,}")
-        print(f"  Phi dimension: {self.phi_dim}")
-        print(f"  Target dimension: {self.target_dim:,}")
-        
-        # Geschätzte Memory-Nutzung pro Sample
-        phi_memory = self.phi_dim * 4  # float32 = 4 bytes
-        target_memory = self.target_dim * 4
-        total_per_sample = phi_memory + target_memory
-        
-        print(f"  Memory per sample: {total_per_sample/1024:.2f} KB")
-        print(f"  Total dataset memory: {(total_per_sample * self.n_events)/(1024**2):.2f} MB")
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("h5file", help="Path to your HDF5 file")
-    parser.add_argument("--batch", type=int, default=4)
-    parser.add_argument("--test-memory", action="store_true", help="Test memory efficiency")
-    args = parser.parse_args()
-
-    loader = voxelDataset(args.h5file)
-    print("=== Meta ===")
-    print("n_events:", loader.n_events)
-    print("phi_dim:", loader.phi_dim, " (phi keys in this order):")
-    print("target_dim (num voxels):", loader.target_dim)
-    print("Diffusion T:", loader.T)
-    
-    # Memory Check
-    loader.check_memory_usage()
-
-    if args.test_memory:
-        print("\n=== Memory Efficiency Test ===")
-        
-        # Test kleines Dataset
-        print("Testing small dataset...")
-        small_ds = loader.get_small_test_dataset(batch_size=args.batch, num_samples=50)
-        for i, (phi_b, x_noisy_b, noise_b, t_b) in enumerate(small_ds.take(3)):
-            print(f"Batch {i}: phi {phi_b.shape}, x_noisy {x_noisy_b.shape}")
-        
-        # Test memory-efficient dataset
-        print("Testing memory-efficient dataset...")
-        efficient_ds = loader.get_noisy_dataset(
-            batch_size=args.batch, 
-            buffer_size=500
-        )
-        for i, (phi_b, x_noisy_b, noise_b, t_b) in enumerate(efficient_ds.take(3)):
-            print(f"Batch {i}: phi {phi_b.shape}, x_noisy {x_noisy_b.shape}")
-    else:
-        print("\n=== Erstes Basissample (ungebatcht) ===")
-        ds = loader.get_base_dataset(shuffle=False)
-        for phi, target in ds.take(1):
-            print("phi shape:", phi.shape)
-            print("phi sample (first 8):", phi[:8].numpy())
-            print("target shape:", target.shape)
-            print("target sample (first 20):", target[:20].numpy())
-
-        print("\n=== Memory-efficient Noisy-Batch ===")
-        noisy_ds = loader.get_noisy_dataset(
-            batch_size=args.batch, 
-            shuffle=True, 
-            buffer_size=1000
-        )
-        for phi_b, x_noisy_b, noise_b, t_b in noisy_ds.take(1):
-            print("phi batch shape:", phi_b.shape)
-            print("x_noisy batch shape:", x_noisy_b.shape)
-            print("noise batch shape:", noise_b.shape)
-            print("t batch shape (per-sample):", t_b.shape, "values:", t_b.numpy())
+        return voxels_raw, areas_raw
