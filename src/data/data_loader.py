@@ -204,14 +204,6 @@ class voxelDataset:
             # Check if voxel_metadata exists
             self.has_voxel_metadata = "voxel_metadata" in f
         
-        # Load grid shapes from config
-        self.grid_shapes = {
-            'PIT': tuple(config['SHAPE_PIT']),    # Nutzt uppercase aus train.py
-            'BOT': tuple(config['SHAPE_BOT']),
-            'WALL': tuple(config['SHAPE_WALL']),
-            'TOP': tuple(config['SHAPE_TOP'])
-        }
-        
         # Build voxel-to-region mapping (once, for efficiency)
         print("\n[Voxel-to-Region Mapping]")
         self.voxel_to_region_idx = np.zeros(len(self.voxel_keys), dtype=np.int32)
@@ -249,7 +241,79 @@ class voxelDataset:
                 raise ValueError(
                     f"Region {region}: Expected {exp} voxels, found {actual}"
                 )
-            print(f"  {region.upper()}: {actual} voxels → Grid {self.grid_shapes[region]}")
+            print(f"  {region.upper()}: {actual} voxels")
+
+        # === GEOMETRY PROCESSING ===
+        self.grid_shapes = {}
+        self.periodic_axes = {}  # Maps region → list of periodic axes
+        self.voxel_to_grid_mapping = {}  # Maps region → {voxel_idx: (axis0, axis1)}
+        
+        for region in ['PIT', 'BOT', 'WALL', 'TOP']:
+            geo_config = config['geometry'][region]
+            
+            # Determine periodic axes
+            periodic = []
+            if geo_config.get('periodic_phi', False):
+                periodic.append(1)  # Phi is axis 1
+            if geo_config.get('periodic_r', False) or geo_config.get('periodic_z', False):
+                periodic.append(0)  # R/Z is axis 0
+            self.periodic_axes[region] = periodic
+            
+            if geo_config['use_auto_geometry']:
+                # Auto-infer shape from voxel indices
+                print(f"\n[Auto-Geometry: {region}]")
+                inferred_shape, voxel_mapping = self._infer_grid_shape_and_mapping(region)
+                
+                # Validate against expected count
+                expected_count = self.region_config['expected_voxel_counts'][region]
+                actual_count = len(self.region_voxel_indices[region])
+                
+                if inferred_shape[0] * inferred_shape[1] != actual_count:
+                    raise ValueError(
+                        f"GEOMETRY MISMATCH: {region}\n"
+                        f"  Inferred shape: {inferred_shape} → {inferred_shape[0] * inferred_shape[1]} voxels\n"
+                        f"  Actual voxels: {actual_count}\n"
+                        f"  Expected: {expected_count}"
+                    )
+                
+                if actual_count != expected_count:
+                    raise ValueError(
+                        f"VOXEL COUNT MISMATCH: {region}\n"
+                        f"  Expected: {expected_count}\n"
+                        f"  Found: {actual_count}"
+                    )
+                
+                # Calculate auto-padding
+                auto_pad = self._calculate_auto_padding(
+                    inferred_shape, 
+                    depth=config['model']['unet_block_depth'],
+                    periodic_axes=periodic
+                )
+                
+                self.grid_shapes[region] = inferred_shape
+                config['PAD'][region] = auto_pad
+                
+                # Store mapping for later use
+                self.voxel_to_grid_mapping[region] = voxel_mapping
+                
+                print(f"  Inferred shape: {inferred_shape}")
+                print(f"  Auto-padding: {auto_pad}")
+                print(f"  Periodic axes: {periodic}")
+                
+            else:
+                # Manual shape from config
+                self.grid_shapes[region] = tuple(geo_config['SHAPE'])
+                
+                # Use legacy padding
+                pad_value = config['model']['padding'].get(region, 0)
+                config['PAD'][region] = pad_value
+                
+                # No voxel mapping needed (uses old reshape logic)
+                self.voxel_to_grid_mapping[region] = None
+                
+                print(f"\n[Manual Geometry: {region}]")
+                print(f"  Shape: {self.grid_shapes[region]}")
+                print(f"  Padding: {config['PAD'][region]}")
         
         # Calculate phi_dim
         base_dim = len(self.active_phi)
@@ -269,6 +333,148 @@ class voxelDataset:
         print(f"  Region targets: {'✓' if self.has_region_targets else '✗'}")
         print(f"  Voxel metadata: {'✓' if self.has_voxel_metadata else '✗'}")
 
+    def _parse_voxel_index(self, index_str: str, region: str):
+        """
+        Parse voxel index string to extract grid coordinates
+        
+        WALL
+        Format: LLZZPP or LLZZZPP or LLZZPPP (auto-detected)
+        - LL: Layer prefix (00=PIT, 01=BOT, 30=WALL, 99=TOP)
+        - ZZ(Z): Z index
+        - PP(P): Phi index
+
+        PIT, BOT, TOP
+        Format: LLYYXX (immer quadratisch)
+        - LL: Layer prefix (00=PIT, 01=BOT, 30=WALL, 99=TOP)
+        - YY(Y): Y index
+        - XX(X): X index
+        
+        Args:
+            index_str: e.g. "300512" or "3005138"
+            region: 'PIT', 'BOT', 'WALL', 'TOP'
+        
+        Returns:
+            (axis0_idx, axis1_idx): Grid coordinates
+        """
+        if len(index_str) > 6:
+            import warnings
+            warnings.warn(
+                f"Voxel index '{index_str}' is {len(index_str)} digits (expected 6). "
+                f"Using dynamic parsing."
+            )
+        
+        layer_prefix = index_str[:2]
+        remainder = index_str[2:]
+        
+        # Dynamic parsing: Try to infer format
+        if len(remainder) == 4:
+            # Standard ZZPP format
+            axis0_idx = int(remainder[:2])
+            axis1_idx = int(remainder[2:4])
+            format_used = "LLZZPP"
+        elif len(remainder) == 5:
+            # Either ZZZPP or ZZPPP
+            # Heuristic: Phi usually has more voxels (cylindrical)
+            # Try ZZPPP first
+            try:
+                axis0_idx = int(remainder[:2])
+                axis1_idx = int(remainder[2:5])
+                format_used = "LLZZPPP"
+            except:
+                # Fallback to ZZZPP
+                axis0_idx = int(remainder[:3])
+                axis1_idx = int(remainder[3:5])
+                format_used = "LLZZZPP"
+        else:
+            raise ValueError(
+                f"Cannot parse voxel index '{index_str}' with {len(remainder)} "
+                f"digits after layer prefix. Expected 4 or 5."
+            )
+        
+        if len(index_str) > 6:
+            import warnings
+            warnings.warn(f"  → Parsed as {format_used}: axis0={axis0_idx}, axis1={axis1_idx}")
+        
+        return (axis0_idx, axis1_idx)
+    
+    def _infer_grid_shape_and_mapping(self, region: str):
+        """
+        Infer grid shape from voxel indices and create mapping
+        
+        Args:
+            region: 'PIT', 'BOT', 'WALL', 'TOP'
+        
+        Returns:
+            shape: (n_axis0, n_axis1, 1)
+            mapping: dict {voxel_list_idx: (axis0, axis1)}
+        """
+        # Get all voxel keys for this region
+        region_indices = self.region_voxel_indices[region]
+        region_keys = [self.voxel_keys[i] for i in region_indices]
+        
+        # Sort keys to ensure consistent ordering
+        region_keys_sorted = sorted(region_keys)
+        
+        # Parse all indices
+        parsed_coords = []
+        for key in region_keys_sorted:
+            coords = self._parse_voxel_index(key, region)
+            parsed_coords.append(coords)
+        
+        # Determine grid dimensions
+        axis0_coords = [c[0] for c in parsed_coords]
+        axis1_coords = [c[1] for c in parsed_coords]
+        
+        n_axis0 = max(axis0_coords) + 1  # Assuming 0-indexed
+        n_axis1 = max(axis1_coords) + 1
+        
+        # Create mapping: original voxel list index → grid coordinates
+        # Need to map from unsorted to sorted order
+        mapping = {}
+        for list_idx in region_indices:
+            key = self.voxel_keys[list_idx]
+            sorted_idx = region_keys_sorted.index(key)
+            mapping[list_idx] = parsed_coords[sorted_idx]
+        
+        return (n_axis0, n_axis1, 1), mapping
+    
+    def _calculate_auto_padding(self, shape, depth=4, periodic_axes=[]):
+        """
+        Calculate padding to make dimensions divisible by 2^depth
+        
+        IMPORTANT: Padding amount is ALWAYS calculated, regardless of periodic_axes.
+        The periodic_axes parameter only determines the TYPE of padding (zero vs circular),
+        not WHETHER to pad.
+        
+        Args:
+            shape: (n_axis0, n_axis1, channels)
+            depth: U-Net pooling depth
+            periodic_axes: List of axes that use circular padding [0, 1]
+        
+        Returns:
+            ((pad_axis0_top, pad_axis0_bot), (pad_axis1_left, pad_axis1_right))
+        """
+        divisor = 2 ** depth
+        n_axis0, n_axis1 = shape[0], shape[1]
+        
+        # Axis 0 padding (ALWAYS calculate, type determined by periodic_axes)
+        if n_axis0 % divisor != 0:
+            target = ((n_axis0 // divisor) + 1) * divisor
+            total_pad = target - n_axis0
+            pad_axis0 = (total_pad // 2, total_pad - total_pad // 2)
+        else:
+            pad_axis0 = (0, 0)
+        
+        # Axis 1 padding (ALWAYS calculate, type determined by periodic_axes)
+        if n_axis1 % divisor != 0:
+            target = ((n_axis1 // divisor) + 1) * divisor
+            total_pad = target - n_axis1
+            pad_axis1 = (total_pad // 2, total_pad - total_pad // 2)
+        else:
+            pad_axis1 = (0, 0)
+        
+        return (pad_axis0, pad_axis1)
+    
     def _split_voxels_to_regions(self, voxel_batch: np.ndarray) -> list:
         """
         Split voxel array into 4 region arrays and reshape to grids
@@ -286,26 +492,40 @@ class voxelDataset:
         for region_name in ['PIT', 'BOT', 'WALL', 'TOP']:
             indices = self.region_voxel_indices[region_name]
             region_voxels = voxel_batch[:, indices]  # (batch, n_voxels_region)
-            
-            # PLACEHOLDER: Reshape to grid (TODO: Real voxel geometry mapping)
             grid_shape = self.grid_shapes[region_name]
-            n_voxels = len(indices)
-            grid_size = np.prod(grid_shape[:-1])  # Exclude channel dimension
             
-            if n_voxels != grid_size:
-                # Pad or truncate to fit grid (TEMPORARY!)
-                if n_voxels < grid_size:
-                    # Pad with zeros
-                    pad_width = ((0, 0), (0, grid_size - n_voxels))
-                    region_voxels = np.pad(region_voxels, pad_width, mode='constant')
-                else:
-                    # Truncate (should not happen with correct grid shapes)
-                    region_voxels = region_voxels[:, :grid_size]
-            
-            # Reshape to grid
-            target_shape = (batch_size,) + grid_shape
-            region_grid = region_voxels.reshape(target_shape)
-            region_batches.append(region_grid)
+            if self.voxel_to_grid_mapping[region_name] is not None:
+                # Use proper voxel-to-grid mapping (auto-geometry)
+                mapping = self.voxel_to_grid_mapping[region_name]
+                
+                # Initialize grid with zeros
+                grid = np.zeros((batch_size, grid_shape[0], grid_shape[1], grid_shape[2]), 
+                               dtype=np.float32)
+                
+                # Fill grid using mapping
+                for voxel_list_idx, (axis0, axis1) in mapping.items():
+                    # Find position in region_voxels array
+                    region_pos = np.where(indices == voxel_list_idx)[0]
+                    if len(region_pos) > 0:
+                        grid[:, axis0, axis1, 0] = region_voxels[:, region_pos[0]]
+                
+                region_batches.append(grid)
+                
+            else:
+                # Legacy: Simple reshape (manual geometry)
+                n_voxels = len(indices)
+                grid_size = np.prod(grid_shape[:-1])
+                
+                if n_voxels != grid_size:
+                    if n_voxels < grid_size:
+                        pad_width = ((0, 0), (0, grid_size - n_voxels))
+                        region_voxels = np.pad(region_voxels, pad_width, mode='constant')
+                    else:
+                        region_voxels = region_voxels[:, :grid_size]
+                
+                target_shape = (batch_size,) + grid_shape
+                region_grid = region_voxels.reshape(target_shape)
+                region_batches.append(region_grid)
         
         return region_batches
 

@@ -16,8 +16,7 @@ def Unet(
         widths,
         attentions,
         pad=((2,1),(0,0),(4,3)),
-        use_1D=False,
-        #pad=((1,0),(0,0),(1,0)),
+        use_1D=False
 ):
     """
     U-Net Architektur für Diffusionsmodelle.
@@ -183,21 +182,27 @@ def Unet(
     
     # Input: Voxel-Daten
     inputs = keras.Input((num_dim))
+    
+    # Apply standard zero-padding (periodic convolutions disabled)
+    def apply_zero_padding(x, pad):
+        """Apply zero padding"""
+        if pad == 0 or pad is None:
+            return x
+        if not isinstance(pad, (list, tuple)):
+            return x
+        return layers.ZeroPadding2D(pad)(x)
+    
     if use_1D:
         #No padding to 1D model
         x = layers.Conv1D(input_embedding_dims, kernel_size=1)(inputs)
         # Zeit-Embedding: Reshape für Broadcasting über 1D-Features
         n = layers.Reshape((1,time_embedding.shape[-1]))(time_embedding)
     else:
-        # 2D-Daten: Zero-Padding kompensiert Größenverlust durch Convolutions
-        # Padding asymmetrisch: pad=(before, after) pro Dimension
-
-        # NEU: Prüfe ob Padding nötig ist (pad != 0)
+        # 2D-Daten: Padding mit periodic boundary conditions wo nötig
         if pad != 0:
-            inputs_padded = layers.ZeroPadding2D(pad)(inputs)
+            inputs_padded = apply_zero_padding(inputs, pad)
             x = layers.Conv2D(input_embedding_dims, kernel_size=1)(inputs_padded)
         else:
-            # Kein Padding (z.B. für WALL mit pad=0)
             x = layers.Conv2D(input_embedding_dims, kernel_size=1)(inputs)
             
         # Zeit-Embedding: Reshape für Broadcasting über 2D-Features
@@ -225,7 +230,15 @@ def Unet(
         outputs = layers.Conv1D(1, kernel_size=1, kernel_initializer="zeros")(x)
     else:
         outputs = layers.Conv2D(1, kernel_size=1, kernel_initializer="zeros")(x)
-        outputs = layers.Cropping2D(pad)(outputs)
+        
+        # Crop padding (accounting for periodic boundaries)
+        if pad != 0:
+            if isinstance(pad, (list, tuple)) and len(pad) == 2:
+                # Proper tuple format
+                outputs = layers.Cropping2D(pad)(outputs)
+            else:
+                # Fallback for pad=0 case
+                pass
 
 
     return inputs, outputs

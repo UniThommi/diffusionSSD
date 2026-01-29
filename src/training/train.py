@@ -27,22 +27,23 @@ if __name__ == '__main__':
 
     # Transformiere config für CaloScore
     config['EMBED'] = config['model']['embed_dim']
+    
+    # Initialize PAD dict (will be filled by data_loader for auto-geometry regions)
+    config['PAD'] = {}
+
     # Filter active regions
     active_regions = config['training'].get('active_regions', {}).get('enabled', ['PIT', 'BOT', 'WALL', 'TOP'])
     config['LAYER_NAMES'] = active_regions
     config['ALL_REGIONS'] = ['PIT', 'BOT', 'WALL', 'TOP']  # Für data_loader
-    config['SHAPE_PIT'] = config['model']['SHAPE_PIT']
-    config['SHAPE_BOT'] = config['model']['SHAPE_BOT']
-    config['SHAPE_WALL'] = config['model']['SHAPE_WALL']
-    config['SHAPE_TOP'] = config['model']['SHAPE_TOP']
+
+    # Grid shapes (will be set by data_loader based on geometry config)
+    config['SHAPE_PIT'] = None
+    config['SHAPE_BOT'] = None
+    config['SHAPE_WALL'] = None
+    config['SHAPE_TOP'] = None
+
     config['num_steps'] = config['diffusion']['num_steps']
     config['ema_decay'] = config['training']['ema_decay']
-
-    # Padding pro Region
-    config['PAD'] = {}
-    for region in config['LAYER_NAMES']:
-        pad_value = config['model']['padding'].get(region, 0)
-        config['PAD'][region] = pad_value
 
     # Area ratios (für loss weighting)
     config['AREA_RATIOS'] = {
@@ -93,6 +94,11 @@ if __name__ == '__main__':
     # Create datasets (mit is_validation Flag)
     train_dataset = voxelDataset(str(train_file), config, is_validation=False)
     val_dataset = voxelDataset(str(val_file), config, is_validation=True)
+
+    # Update config with inferred shapes from data_loader
+    for region in config['LAYER_NAMES']:
+        shape_key = f'SHAPE_{region}'
+        config[shape_key] = list(train_dataset.grid_shapes[region])
     
     # Get clean datasets (CaloScore style - no noise injection)
     train_data_clean = train_dataset.get_dataset(
@@ -257,6 +263,120 @@ if __name__ == '__main__':
 
     callbacks.append(MemoryCleanup())
 
+    # === Incremental Plotting ===
+    if rank == 0 and config['training'].get('save_training_plots', False):
+        class IncrementalPlotter(Callback):
+            def __init__(self, checkpoint_dir, plot_every=10, run_name=""):
+                super().__init__()
+                self.checkpoint_dir = Path(checkpoint_dir)
+                self.plot_every = plot_every
+                self.run_name = run_name
+                self.epoch_history = {
+                    'loss': [], 'val_loss': [],
+                    'loss_area': [], 'val_loss_layer': [],
+                    'loss_WALL': [], 'val_loss_WALL': []
+                }
+            
+            def on_epoch_end(self, epoch, logs=None):
+                # Append current metrics
+                for key in self.epoch_history.keys():
+                    if key in logs:
+                        self.epoch_history[key].append(float(logs[key]))
+                
+                # Plot every N epochs or on last epoch
+                if self.plot_every > 0:
+                    if (epoch + 1) % self.plot_every == 0 or epoch == 0:
+                        self._plot_and_save()
+                        gc.collect()
+            
+            def on_train_end(self, logs=None):
+                # Final plot at end of training
+                self._plot_and_save(final=True)
+                gc.collect()
+            
+            def _plot_and_save(self, final=False):
+                if len(self.epoch_history['loss']) == 0:
+                    return
+                
+                fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+                
+                suffix = "_final" if final else "_progress"
+                title_suffix = " (Final)" if final else f" (Epoch {len(self.epoch_history['loss'])})"
+                
+                fig.suptitle(f"Training History - {self.run_name}{title_suffix}", 
+                            fontsize=14, fontweight='bold')
+                
+                epochs = range(1, len(self.epoch_history['loss']) + 1)
+                
+                # Total Loss
+                axes[0, 0].plot(epochs, self.epoch_history['loss'], 
+                            label='Train', linewidth=2, marker='o', markersize=3)
+                axes[0, 0].plot(epochs, self.epoch_history['val_loss'], 
+                            label='Val', linewidth=2, marker='s', markersize=3)
+                axes[0, 0].set_xlabel('Epoch')
+                axes[0, 0].set_ylabel('Total Loss')
+                axes[0, 0].set_title('Total Loss')
+                axes[0, 0].legend()
+                axes[0, 0].grid(True, alpha=0.3)
+                
+                # Area Loss
+                axes[0, 1].plot(epochs, self.epoch_history['loss_area'], 
+                            label='Train', linewidth=2, marker='o', markersize=3)
+                axes[0, 1].plot(epochs, self.epoch_history['val_loss_layer'], 
+                            label='Val', linewidth=2, marker='s', markersize=3)
+                axes[0, 1].set_xlabel('Epoch')
+                axes[0, 1].set_ylabel('Area Loss')
+                axes[0, 1].set_title('Area Hits Loss')
+                axes[0, 1].legend()
+                axes[0, 1].grid(True, alpha=0.3)
+                
+                # Voxel Loss (WALL)
+                axes[1, 0].plot(epochs, self.epoch_history['loss_WALL'], 
+                            label='Train', linewidth=2, marker='o', markersize=3)
+                axes[1, 0].plot(epochs, self.epoch_history['val_loss_WALL'], 
+                            label='Val', linewidth=2, marker='s', markersize=3)
+                axes[1, 0].set_xlabel('Epoch')
+                axes[1, 0].set_ylabel('Voxel Loss')
+                axes[1, 0].set_title('WALL Voxel Loss')
+                axes[1, 0].legend()
+                axes[1, 0].grid(True, alpha=0.3)
+                
+                # Best Epoch Info
+                best_epoch = int(np.argmin(self.epoch_history['val_loss']))
+                best_val_loss = self.epoch_history['val_loss'][best_epoch]
+                
+                axes[1, 1].axis('off')
+                info_text = f"""
+                Best Epoch: {best_epoch + 1}
+                Best Val Loss: {best_val_loss:.4f}
+                
+                Current Metrics:
+                Train Loss: {self.epoch_history['loss'][-1]:.4f}
+                Val Loss: {self.epoch_history['val_loss'][-1]:.4f}
+                
+                Total Epochs: {len(self.epoch_history['loss'])}
+                """
+                axes[1, 1].text(0.1, 0.5, info_text, fontsize=12, 
+                            verticalalignment='center', family='monospace',
+                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                
+                plt.tight_layout()
+                plot_path = self.checkpoint_dir / f'training_history{suffix}.png'
+                plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+                plt.close(fig)  # CRITICAL: Free memory
+                
+                if not final:
+                    print(f"  → Plot updated: {plot_path}")
+        
+        plot_freq = config['training'].get('plot_update_frequency', 10)
+        incremental_plotter = IncrementalPlotter(
+            checkpoint_dir=str(checkpoint_folder),
+            plot_every=plot_freq,
+            run_name=config['training']['run_name']
+        )
+        callbacks.append(incremental_plotter)
+        print(f"✓ Incremental plotting enabled (every {plot_freq} epochs)")
+
     # === TensorBoard Logging ===
     if rank == 0 and config['training'].get('enable_tensorboard', False):
         log_dir = Path('./logs') / config['training']['run_name']
@@ -292,83 +412,27 @@ if __name__ == '__main__':
 
     # === Save Training History ===
     if rank == 0:
-        # 1. Save history as JSON
+        # Save history as JSON (optional)
         if config['training'].get('save_history_json', False):
             history_path = checkpoint_folder / 'history.json'
             with open(history_path, 'w') as f:
-                # Convert numpy types to Python types
                 history_dict = {k: [float(v) for v in vals] 
                                for k, vals in history.history.items()}
                 json.dump(history_dict, f, indent=2)
             print(f"✓ Training history saved: {history_path}")
         
-        # 2. Plot training curves
-        if config['training'].get('save_training_plots', False):
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle(f"Training History - {config['training']['run_name']}", 
-                        fontsize=14, fontweight='bold')
-            
-            # Total Loss
-            axes[0, 0].plot(history.history['loss'], label='Train', linewidth=2)
-            axes[0, 0].plot(history.history['val_loss'], label='Val', linewidth=2)
-            axes[0, 0].set_xlabel('Epoch')
-            axes[0, 0].set_ylabel('Total Loss')
-            axes[0, 0].set_title('Total Loss')
-            axes[0, 0].legend()
-            axes[0, 0].grid(True, alpha=0.3)
-            
-            # Area Loss
-            axes[0, 1].plot(history.history['loss_area'], label='Train', linewidth=2)
-            axes[0, 1].plot(history.history['val_loss_layer'], label='Val', linewidth=2)
-            axes[0, 1].set_xlabel('Epoch')
-            axes[0, 1].set_ylabel('Area Loss')
-            axes[0, 1].set_title('Area Hits Loss')
-            axes[0, 1].legend()
-            axes[0, 1].grid(True, alpha=0.3)
-            
-            # Voxel Loss (WALL)
-            axes[1, 0].plot(history.history['loss_WALL'], label='Train', linewidth=2)
-            axes[1, 0].plot(history.history['val_loss_WALL'], label='Val', linewidth=2)
-            axes[1, 0].set_xlabel('Epoch')
-            axes[1, 0].set_ylabel('Voxel Loss')
-            axes[1, 0].set_title('WALL Voxel Loss')
-            axes[1, 0].legend()
-            axes[1, 0].grid(True, alpha=0.3)
-            
-            # Best Epoch Indicator
-            best_epoch = np.argmin(history.history['val_loss'])
-            best_val_loss = history.history['val_loss'][best_epoch]
-            
-            axes[1, 1].axis('off')
-            info_text = f"""
-            Best Epoch: {best_epoch + 1}
-            Best Val Loss: {best_val_loss:.4f}
-            
-            Final Metrics:
-            Train Loss: {history.history['loss'][-1]:.4f}
-            Val Loss: {history.history['val_loss'][-1]:.4f}
-            
-            Total Epochs: {len(history.history['loss'])}
-            """
-            axes[1, 1].text(0.1, 0.5, info_text, fontsize=12, 
-                           verticalalignment='center', family='monospace',
-                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            
-            plt.tight_layout()
-            plot_path = checkpoint_folder / 'training_history.png'
-            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"✓ Training plots saved: {plot_path}")
-            
-            # Save best epoch info
-            best_epoch_path = checkpoint_folder / 'best_epoch.txt'
-            with open(best_epoch_path, 'w') as f:
-                f.write(f"Best Epoch: {best_epoch + 1}\n")
-                f.write(f"Best Validation Loss: {best_val_loss:.4f}\n")
-                f.write(f"\nMetrics at best epoch:\n")
-                for key in history.history.keys():
-                    if 'val_' in key:
-                        f.write(f"  {key}: {history.history[key][best_epoch]:.4f}\n")
-            print(f"✓ Best epoch info saved: {best_epoch_path}")
+        # Save best epoch info
+        best_epoch = np.argmin(history.history['val_loss'])
+        best_val_loss = history.history['val_loss'][best_epoch]
+        
+        best_epoch_path = checkpoint_folder / 'best_epoch.txt'
+        with open(best_epoch_path, 'w') as f:
+            f.write(f"Best Epoch: {best_epoch + 1}\n")
+            f.write(f"Best Validation Loss: {best_val_loss:.4f}\n")
+            f.write(f"\nMetrics at best epoch:\n")
+            for key in history.history.keys():
+                if 'val_' in key:
+                    f.write(f"  {key}: {history.history[key][best_epoch]:.4f}\n")
+        print(f"✓ Best epoch info saved: {best_epoch_path}")
         
         print("\n✓ All outputs saved successfully")

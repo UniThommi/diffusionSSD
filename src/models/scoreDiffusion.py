@@ -137,6 +137,7 @@ class scoreDiffusion(keras.Model):
             # Build U-Net for this area's voxel distribution
             # Input: noisy voxel grid [batch, z, phi, 1]
             # Output: denoised voxel grid (same shape)
+            
             inputs, outputs = Unet(
                 data_shape,
                 voxel_conditional,
@@ -145,9 +146,9 @@ class scoreDiffusion(keras.Model):
                 kernel=3,
                 block_depth=4,
                 widths=[32, 64, 96, 128],
-                attentions=[False, True, True, True],   # Self-attention in deeper layers
+                attentions=[False, True, True, True],
                 pad=self.config['PAD'][area_name],
-                use_1D=False                             # Treat as 2D with channel dimension
+                use_1D=False
             )
 
             # Wrap U-Net in Keras Model

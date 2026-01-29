@@ -10,6 +10,7 @@ run_name = "nc_score_baseline_v1"
 enable_tensorboard = false
 save_training_plots = true
 save_history_json = true
+plot_update_frequency = 10 
 
 # Hardware
 device = "cpu"  # "cpu" or "gpu"
@@ -23,7 +24,7 @@ train_val_split = 0.8
 
 # Hyperparameters
 batch_size = 4 # 32 in CaloScore
-num_epochs = 100
+num_epochs = 5
 learning_rate = 1e-4
 optimizer = "Adamax"
 use_cosine_decay = true  # learning_rate
@@ -36,7 +37,7 @@ ema_decay = 0.999
 checkpoint_dir = "./checkpoints"
 
 # Event limiting (null = use all events)
-max_events = 1000
+max_events = 100
 
 # Distillation (NICHT IMPLEMENTIERT - nur Struktur)
 enable_distillation = false
@@ -51,27 +52,48 @@ num_resnet_layers = 3
 resnet_hidden_dim = 128
 
 # UNet (Voxel-Modell pro Region)
-unet_block_depth = 4    #4
+unet_block_depth = 4
 unet_widths = [32, 64, 96, 128]
 unet_attentions = [false, true, true, true]
 unet_stride = 2
 unet_kernel = 3
 unet_input_embedding_dims = 16
 
-# Area Names
-LAYER_NAMES = ["PIT", "BOT", "WALL", "TOP"]
-
-# Grid shapes pro Region (PLACEHOLDER - TODO: Echte Geometrie)
-SHAPE_PIT = [36, 36, 1]
-SHAPE_BOT = [20, 20, 1]
-SHAPE_WALL = [80, 80, 1]
-SHAPE_TOP = [40, 40, 1]
-
+# Legacy padding (nur wenn use_auto_geometry=false)
 [model.padding]
-PIT  = [[2, 2], [2, 2]]  # 36 → 40
-BOT  = [[6, 6], [6, 6]]  # 20 → 32
-WALL = 0                          # 80 → 80 (bereits teilbar)
-TOP  = [[4, 4], [4, 4]]  # 40 → 48
+PIT  = [[2, 2], [2, 2]]
+BOT  = [[6, 6], [6, 6]]
+WALL = 0
+TOP  = [[4, 4], [4, 4]]
+
+# ============================================================================
+# Geometry Configuration per Region
+# ============================================================================
+
+[geometry.PIT]
+use_auto_geometry = false
+SHAPE = [36, 36, 1]  # [n_r, n_phi, channels]
+periodic_phi = false  # FIX: Not yet implemented
+periodic_r = false    # FIX: Not yet implemented
+
+[geometry.BOT]
+use_auto_geometry = false
+SHAPE = [20, 20, 1]  # [n_r, n_phi, channels]
+periodic_phi = false  # FIX: Not yet implemented
+periodic_r = false    # FIX: Not yet implemented
+
+[geometry.WALL]
+use_auto_geometry = true
+# SHAPE wird automatisch inferiert aus Voxel-Indices
+# Expected: [n_z, n_phi, 1] mit n_z*n_phi = 6394
+periodic_phi = true   # Phi-Achse ist periodic (zylindrisch)
+periodic_z = false    # Z-Achse ist non-periodic
+
+[geometry.TOP]
+use_auto_geometry = false
+SHAPE = [40, 40, 1]  # [n_r, n_phi, channels]
+periodic_phi = false  # FIX: Not yet implemented
+periodic_r = false    # FIX: Not yet implemented
 
 [diffusion]
 num_steps = 512
