@@ -6,6 +6,11 @@
 # Run identifier (für separate Checkpoint-Ordner)
 run_name = "nc_score_baseline_v1"
 
+# Logging & Monitoring
+enable_tensorboard = false
+save_training_plots = true
+save_history_json = true
+
 # Hardware
 device = "cpu"  # "cpu" or "gpu"
 enable_horovod = false
@@ -17,8 +22,8 @@ val_file = "resum_output_0_validation.hdf5"
 train_val_split = 0.8
 
 # Hyperparameters
-batch_size = 4  # 32 in CaloScore
-num_epochs = 5   # 100
+batch_size = 4 # 32 in CaloScore
+num_epochs = 100
 learning_rate = 1e-4
 optimizer = "Adamax"
 use_cosine_decay = true  # learning_rate
@@ -29,6 +34,9 @@ ema_decay = 0.999
 
 # Checkpointing
 checkpoint_dir = "./checkpoints"
+
+# Event limiting (null = use all events)
+max_events = 1000
 
 # Distillation (NICHT IMPLEMENTIERT - nur Struktur)
 enable_distillation = false

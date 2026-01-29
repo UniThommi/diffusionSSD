@@ -7,10 +7,14 @@ import numpy as np
 import os
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, Callback, TensorBoard
 import toml
 from pathlib import Path
 import gc
+import json
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for NERSC
+import matplotlib.pyplot as plt
 
 print(f"Eager execution: {tf.executing_eagerly()}")
 
@@ -77,18 +81,18 @@ if __name__ == '__main__':
     
     # === Data Loading ===
     from src.data.data_loader import voxelDataset
-    
+
     data_dir = Path(config['training']['data_dir'])
     train_file = data_dir / config['training']['train_file']
     val_file = data_dir / config['training']['val_file']
-    
+
     print("\n=== Loading Data ===")
     print(f"Train: {train_file}")
     print(f"Val: {val_file}")
-    
-    # Create datasets (pass full config)
-    train_dataset = voxelDataset(str(train_file), config)
-    val_dataset = voxelDataset(str(val_file), config)
+
+    # Create datasets (mit is_validation Flag)
+    train_dataset = voxelDataset(str(train_file), config, is_validation=False)
+    val_dataset = voxelDataset(str(val_file), config, is_validation=True)
     
     # Get clean datasets (CaloScore style - no noise injection)
     train_data_clean = train_dataset.get_dataset(
@@ -126,11 +130,25 @@ if __name__ == '__main__':
         
     # Train/Val split
     train_frac = config['training']['train_val_split']
-    data_size = train_dataset.n_events
     num_cond = train_dataset.phi_dim
     num_area = 4
     
-    print(f"\nData size: {data_size}")
+    # Training nutzt bereits die limitierte Zahl OHNE nochmalige Multiplikation
+    train_size = train_dataset.n_events
+    val_size = val_dataset.n_events
+
+    print(f"\n=== DEBUG ===")
+    print(f"train_dataset.n_events = {train_dataset.n_events}")
+    print(f"train_dataset.n_events_total = {train_dataset.n_events_total}")
+    print(f"train_size = {train_size}")
+    print(f"val_size = {val_size}")
+
+    print(f"\n=== Training Configuration ===")
+    print(f"Training events: {train_size:,}")
+    print(f"Validation events: {val_size:,}")
+    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Steps per epoch (train): {int(train_size / BATCH_SIZE)}")
+    print(f"Validation steps: {int(val_size / BATCH_SIZE)}")
     print(f"Conditioning dims: {num_cond}")
     print(f"Number of areas: {num_area}")
     
@@ -173,7 +191,7 @@ if __name__ == '__main__':
     if config['training']['use_cosine_decay']:
         lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
             initial_learning_rate=LR * size,
-            decay_steps=NUM_EPOCHS * int(data_size * train_frac / BATCH_SIZE)
+            decay_steps=NUM_EPOCHS * int(train_size / BATCH_SIZE)  # ← Korrigiert
         )
     else:
         lr_schedule = LR * size
@@ -192,15 +210,66 @@ if __name__ == '__main__':
         weighted_metrics=[]
     )
     
-    # === Checkpoint (master only) ===
+    # Custom Checkpoint Callback für Multi-Model Architektur
+    class MultiModelCheckpoint(Callback):
+        """Speichert Area- und Voxel-Modelle separat"""
+        def __init__(self, checkpoint_dir, monitor='val_loss', save_best_only=True):
+            super().__init__()
+            self.checkpoint_dir = checkpoint_dir
+            self.monitor = monitor
+            self.save_best_only = save_best_only
+            self.best_loss = float('inf')
+        
+        def on_epoch_end(self, epoch, logs=None):
+            current_loss = logs.get(self.monitor)
+            
+            if current_loss is None:
+                return
+            
+            if not self.save_best_only or current_loss < self.best_loss:
+                self.best_loss = current_loss
+                
+                # Save Area Model
+                area_path = os.path.join(self.checkpoint_dir, 'area_model_best.weights.h5')
+                self.model.model_area.save_weights(area_path)
+                
+                # Save Voxel Models
+                for area_name in self.model.active_areas:
+                    voxel_path = os.path.join(
+                        self.checkpoint_dir, 
+                        f'voxel_{area_name}_best.weights.h5'
+                    )
+                    self.model.model_voxels[area_name].save_weights(voxel_path)
+                
+                print(f"\n✓ Checkpoint saved (epoch {epoch+1}, {self.monitor}={current_loss:.4f})")
+
     if rank == 0:
-        checkpoint = ModelCheckpoint(
-            str(checkpoint_folder / 'checkpoint.weights.h5'),
-            save_best_only=True,
-            mode='auto',
-            save_weights_only=True
+        checkpoint = MultiModelCheckpoint(
+            checkpoint_dir=str(checkpoint_folder),
+            monitor='val_loss',
+            save_best_only=True
         )
         callbacks.append(checkpoint)
+
+    class MemoryCleanup(Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            gc.collect()
+
+    callbacks.append(MemoryCleanup())
+
+    # === TensorBoard Logging ===
+    if rank == 0 and config['training'].get('enable_tensorboard', False):
+        log_dir = Path('./logs') / config['training']['run_name']
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        tensorboard = TensorBoard(
+            log_dir=str(log_dir),
+            histogram_freq=0,  # Keine Weight-Histogramme (langsam)
+            write_graph=False,  # Kein Graph (komplex bei Multi-Model)
+            update_freq='epoch'
+        )
+        callbacks.append(tensorboard)
+        print(f"✓ TensorBoard logging enabled: {log_dir}")
     
     # === Training ===
     print("\n" + "="*80)
@@ -210,13 +279,96 @@ if __name__ == '__main__':
     history = model.fit(
         train_data_clean.batch(BATCH_SIZE),
         epochs=NUM_EPOCHS,
-        steps_per_epoch=int(data_size * train_frac / BATCH_SIZE),
+        steps_per_epoch=int(train_size / BATCH_SIZE),  # ← Korrigiert: Keine train_frac mehr!
         validation_data=val_data_clean.batch(BATCH_SIZE),
-        validation_steps=int(val_dataset.n_events / BATCH_SIZE),
+        validation_steps=int(val_size / BATCH_SIZE),  # ← Korrigiert
         verbose=1 if rank == 0 else 0,
         callbacks=callbacks
-    )
+    )   
     
     print("\n" + "="*80)
     print("TRAINING COMPLETE")
     print("="*80)
+
+    # === Save Training History ===
+    if rank == 0:
+        # 1. Save history as JSON
+        if config['training'].get('save_history_json', False):
+            history_path = checkpoint_folder / 'history.json'
+            with open(history_path, 'w') as f:
+                # Convert numpy types to Python types
+                history_dict = {k: [float(v) for v in vals] 
+                               for k, vals in history.history.items()}
+                json.dump(history_dict, f, indent=2)
+            print(f"✓ Training history saved: {history_path}")
+        
+        # 2. Plot training curves
+        if config['training'].get('save_training_plots', False):
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            fig.suptitle(f"Training History - {config['training']['run_name']}", 
+                        fontsize=14, fontweight='bold')
+            
+            # Total Loss
+            axes[0, 0].plot(history.history['loss'], label='Train', linewidth=2)
+            axes[0, 0].plot(history.history['val_loss'], label='Val', linewidth=2)
+            axes[0, 0].set_xlabel('Epoch')
+            axes[0, 0].set_ylabel('Total Loss')
+            axes[0, 0].set_title('Total Loss')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Area Loss
+            axes[0, 1].plot(history.history['loss_area'], label='Train', linewidth=2)
+            axes[0, 1].plot(history.history['val_loss_layer'], label='Val', linewidth=2)
+            axes[0, 1].set_xlabel('Epoch')
+            axes[0, 1].set_ylabel('Area Loss')
+            axes[0, 1].set_title('Area Hits Loss')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Voxel Loss (WALL)
+            axes[1, 0].plot(history.history['loss_WALL'], label='Train', linewidth=2)
+            axes[1, 0].plot(history.history['val_loss_WALL'], label='Val', linewidth=2)
+            axes[1, 0].set_xlabel('Epoch')
+            axes[1, 0].set_ylabel('Voxel Loss')
+            axes[1, 0].set_title('WALL Voxel Loss')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Best Epoch Indicator
+            best_epoch = np.argmin(history.history['val_loss'])
+            best_val_loss = history.history['val_loss'][best_epoch]
+            
+            axes[1, 1].axis('off')
+            info_text = f"""
+            Best Epoch: {best_epoch + 1}
+            Best Val Loss: {best_val_loss:.4f}
+            
+            Final Metrics:
+            Train Loss: {history.history['loss'][-1]:.4f}
+            Val Loss: {history.history['val_loss'][-1]:.4f}
+            
+            Total Epochs: {len(history.history['loss'])}
+            """
+            axes[1, 1].text(0.1, 0.5, info_text, fontsize=12, 
+                           verticalalignment='center', family='monospace',
+                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            plt.tight_layout()
+            plot_path = checkpoint_folder / 'training_history.png'
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"✓ Training plots saved: {plot_path}")
+            
+            # Save best epoch info
+            best_epoch_path = checkpoint_folder / 'best_epoch.txt'
+            with open(best_epoch_path, 'w') as f:
+                f.write(f"Best Epoch: {best_epoch + 1}\n")
+                f.write(f"Best Validation Loss: {best_val_loss:.4f}\n")
+                f.write(f"\nMetrics at best epoch:\n")
+                for key in history.history.keys():
+                    if 'val_' in key:
+                        f.write(f"  {key}: {history.history[key][best_epoch]:.4f}\n")
+            print(f"✓ Best epoch info saved: {best_epoch_path}")
+        
+        print("\n✓ All outputs saved successfully")

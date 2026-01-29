@@ -11,3 +11,4 @@ checkpoints_cpu/
 src/optuna*
 *.png
 src/training_logs
+logs

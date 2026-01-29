@@ -29,16 +29,18 @@ class voxelDataset:
         "gammaE4_keV", "gammapx4", "gammapy4", "gammapz4"
     ]
     
-    def __init__(self, h5_path: str, config: dict):
+    def __init__(self, h5_path: str, config: dict, is_validation: bool = False):
         """
         Initialize dataset for CaloScore-compatible output
         
         Args:
             h5_path: Path to HDF5 file
             config: Full config dict from config.toml
+            is_validation: If True, apply proportional event limiting
         """
         self.h5_path = h5_path
         self.config = config
+        self.is_validation = is_validation
         
         # Extract sub-configs
         self.feature_config = config['features']
@@ -47,6 +49,46 @@ class voxelDataset:
         self.onehot_config = config['onehot']
         self.region_config = config['regions']
         self.model_config = config['model']
+
+        # Read shapes from HDF5
+        with h5py.File(h5_path, "r") as f:
+            if "phi" not in f or "target" not in f:
+                raise ValueError("HDF5 must contain 'target' and 'phi' groups")
+            self.n_events_total = f["phi"]["#gamma"].shape[0]
+        
+        # === EVENT LIMITING ===
+        max_events = config['training'].get('max_events', None)
+
+        print(f"[DEBUG] max_events from config: {max_events}")  # ← Debug-Print!
+        print(f"[DEBUG] is_validation: {is_validation}")
+        
+        if max_events is not None:
+            if is_validation:
+                # Proportional limiting for validation
+                train_events = min(max_events, self.n_events_total)
+                # Berechne Verhältnis aus train.py's train_val_split
+                train_frac = config['training']['train_val_split']
+                val_frac = 1.0 - train_frac
+                
+                # Proportionale Val-Events
+                self.n_events = int(train_events * val_frac / train_frac)
+                self.n_events = min(self.n_events, self.n_events_total)
+                
+                print(f"\n[Event Limiting - Validation]")
+                print(f"  Total available: {self.n_events_total:,}")
+                print(f"  Train events: {train_events:,}")
+                print(f"  Val events (proportional): {self.n_events:,}")
+            else:
+                # Direct limiting for training
+                self.n_events = min(max_events, self.n_events_total)
+                
+                print(f"\n[Event Limiting - Training]")
+                print(f"  Total available: {self.n_events_total:,}")
+                print(f"  Using: {self.n_events:,} ({100*self.n_events/self.n_events_total:.1f}%)")
+        else:
+            # No limiting - use all events
+            self.n_events = self.n_events_total
+            print(f"\n[Event Limiting] DISABLED - Using all {self.n_events:,} events")
         
         # Active features
         self.active_phi_raw = self.feature_config['active_phi'].copy()
@@ -150,9 +192,6 @@ class voxelDataset:
         
         # Read shapes from HDF5
         with h5py.File(h5_path, "r") as f:
-            if "phi" not in f or "target" not in f:
-                raise ValueError("HDF5 must contain 'target' and 'phi' groups")
-            self.n_events = f["phi"]["#gamma"].shape[0]            
             self.voxel_keys = list(f["target"].keys())
             
             # Check if region targets exist
@@ -219,7 +258,7 @@ class voxelDataset:
         self.target_dim = len(self.voxel_keys)
         
         print(f"\n✓ voxelDataset initialized")
-        print(f"  Events: {self.n_events:,}")
+        print(f"  Using events: {self.n_events:,} (Total available: {self.n_events_total:,})")
         print(f"  Base phi features: {base_dim}")
         if self.enable_material_onehot:
             print(f"  + Material One-Hot: {self.n_material_categories}")
@@ -545,7 +584,7 @@ class voxelDataset:
         """
         # Define output signature (CaloScore compatible)
         output_signature = (
-            {  # ← Dictionary von TensorSpecs
+            {
                 'PIT': tf.TensorSpec(shape=self.grid_shapes['PIT'], dtype=tf.float32),
                 'BOT': tf.TensorSpec(shape=self.grid_shapes['BOT'], dtype=tf.float32),
                 'WALL': tf.TensorSpec(shape=self.grid_shapes['WALL'], dtype=tf.float32),
@@ -565,7 +604,13 @@ class voxelDataset:
         )
         
         if shuffle:
-            ds = ds.shuffle(buffer_size=min(5000, self.n_events))
+            # Dynamischer Buffer: Min(20% der Events, aber maximal 10k)
+            buffer_size = min(
+                max(int(0.2 * self.n_events), 100),  # Mindestens 100
+                10000  # Maximal 10k für Memory
+            )
+            print(f"  Shuffle buffer: {buffer_size:,} events")
+            ds = ds.shuffle(buffer_size=buffer_size)
         
         return ds
     
