@@ -24,7 +24,7 @@ train_val_split = 0.8
 
 # Hyperparameters
 batch_size = 4 # 32 in CaloScore
-num_epochs = 5
+num_epochs = 100
 learning_rate = 1e-4
 optimizer = "Adamax"
 use_cosine_decay = true  # learning_rate
@@ -90,10 +90,11 @@ periodic_phi = true   # Phi-Achse ist periodic (zylindrisch)
 periodic_z = false    # Z-Achse ist non-periodic
 
 [geometry.TOP]
-use_auto_geometry = false
-SHAPE = [40, 40, 1]  # [n_r, n_phi, channels]
-periodic_phi = false  # FIX: Not yet implemented
-periodic_r = false    # FIX: Not yet implemented
+use_auto_geometry = true
+# SHAPE wird automatisch inferiert aus Voxel-Indices
+# Expected: [n_y, n_x, 1] kartesisches Grid (Donut-Form)
+periodic_y = false   # Y-Achse ist nicht periodic
+periodic_x = false   # X-Achse ist nicht periodic
 
 [diffusion]
 num_steps = 512
@@ -142,4 +143,4 @@ expected_voxel_counts = { PIT = 1261, BOT = 400, WALL = 6394, TOP = 1528 }
 
 [training.active_regions]
 # Welche Regionen trainiert werden sollen
-enabled = ["WALL"]  # Für alle 4: ["PIT", "BOT", "WALL", "TOP"]
+enabled = ["PIT", "BOT", "WALL", "TOP"]  # Für alle 4: ["PIT", "BOT", "WALL", "TOP"]

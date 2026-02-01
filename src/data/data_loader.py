@@ -251,12 +251,22 @@ class voxelDataset:
         for region in ['PIT', 'BOT', 'WALL', 'TOP']:
             geo_config = config['geometry'][region]
             
-            # Determine periodic axes
+            # Determine periodic axes (region-specific naming)
             periodic = []
-            if geo_config.get('periodic_phi', False):
-                periodic.append(1)  # Phi is axis 1
-            if geo_config.get('periodic_r', False) or geo_config.get('periodic_z', False):
-                periodic.append(0)  # R/Z is axis 0
+            
+            if region == 'TOP':
+                # TOP uses cartesian coordinates (y, x)
+                if geo_config.get('periodic_y', False):
+                    periodic.append(0)  # Y is axis 0
+                if geo_config.get('periodic_x', False):
+                    periodic.append(1)  # X is axis 1
+            else:
+                # Other regions use cylindrical/radial naming
+                if geo_config.get('periodic_phi', False):
+                    periodic.append(1)  # Phi is axis 1
+                if geo_config.get('periodic_r', False) or geo_config.get('periodic_z', False):
+                    periodic.append(0)  # R/Z is axis 0
+            
             self.periodic_axes[region] = periodic
             
             if geo_config['use_auto_geometry']:
@@ -268,13 +278,29 @@ class voxelDataset:
                 expected_count = self.region_config['expected_voxel_counts'][region]
                 actual_count = len(self.region_voxel_indices[region])
                 
-                if inferred_shape[0] * inferred_shape[1] != actual_count:
-                    raise ValueError(
-                        f"GEOMETRY MISMATCH: {region}\n"
-                        f"  Inferred shape: {inferred_shape} → {inferred_shape[0] * inferred_shape[1]} voxels\n"
-                        f"  Actual voxels: {actual_count}\n"
-                        f"  Expected: {expected_count}"
-                    )
+                # Check if inferred shape matches actual count
+                # Exception: TOP is a sparse grid (donut shape), so grid_size > actual_voxels
+                if region != 'TOP':
+                    if inferred_shape[0] * inferred_shape[1] != actual_count:
+                        raise ValueError(
+                            f"GEOMETRY MISMATCH: {region}\n"
+                            f"  Inferred shape: {inferred_shape} → {inferred_shape[0] * inferred_shape[1]} voxels\n"
+                            f"  Actual voxels: {actual_count}\n"
+                            f"  Expected: {expected_count}"
+                        )
+                else:
+                    # TOP: Sparse grid (donut), verify it's reasonable
+                    grid_size = inferred_shape[0] * inferred_shape[1]
+                    utilization = actual_count / grid_size
+                    
+                    print(f"  Grid utilization: {utilization*100:.1f}% ({actual_count}/{grid_size})")
+                    
+                    if utilization < 0.3:
+                        import warnings
+                        warnings.warn(
+                            f"TOP grid utilization very low ({utilization*100:.1f}%). "
+                            f"Grid might be inefficient. Consider polar coordinates."
+                        )
                 
                 if actual_count != expected_count:
                     raise ValueError(
@@ -337,69 +363,103 @@ class voxelDataset:
         """
         Parse voxel index string to extract grid coordinates
         
-        WALL
-        Format: LLZZPP or LLZZZPP or LLZZPPP (auto-detected)
-        - LL: Layer prefix (00=PIT, 01=BOT, 30=WALL, 99=TOP)
-        - ZZ(Z): Z index
-        - PP(P): Phi index
-
-        PIT, BOT, TOP
-        Format: LLYYXX (immer quadratisch)
-        - LL: Layer prefix (00=PIT, 01=BOT, 30=WALL, 99=TOP)
-        - YY(Y): Y index
-        - XX(X): X index
+        Format depends on region:
+        
+        WALL (cylindrical):
+          Format: LLZZPP or LLZZZPP or LLZZPPP (auto-detected)
+          - LL: Layer prefix (30)
+          - ZZ(Z): Z index
+          - PP(P): Phi index
+        
+        TOP (cartesian):
+          Format: LLYYXX (always 6 digits)
+          - LL: Layer prefix (99)
+          - YY: Y index (2 digits)
+          - XX: X index (2 digits)
+        
+        PIT, BOT (cartesian, legacy):
+          Format: LLYYXX (6 digits)
+          - LL: Layer prefix (00 or 01)
+          - YY: Y index
+          - XX: X index
         
         Args:
-            index_str: e.g. "300512" or "3005138"
+            index_str: e.g. "300512" or "990312" or "001523"
             region: 'PIT', 'BOT', 'WALL', 'TOP'
         
         Returns:
             (axis0_idx, axis1_idx): Grid coordinates
         """
-        if len(index_str) > 6:
-            import warnings
-            warnings.warn(
-                f"Voxel index '{index_str}' is {len(index_str)} digits (expected 6). "
-                f"Using dynamic parsing."
-            )
-        
         layer_prefix = index_str[:2]
         remainder = index_str[2:]
         
-        # Dynamic parsing: Try to infer format
+        # TOP: Fixed format ZZYYXX (99YYXX)
+        if region == 'TOP':
+            if len(remainder) != 4:
+                raise ValueError(
+                    f"TOP voxel index '{index_str}' must have format 99YYXX (6 digits total). "
+                    f"Got {len(index_str)} digits."
+                )
+            axis0_idx = int(remainder[0:2])  # YY
+            axis1_idx = int(remainder[2:4])  # XX
+            return (axis0_idx, axis1_idx)
+        
+        # WALL: Dynamic parsing for variable phi/z dimensions
+        if region == 'WALL':
+            if len(index_str) > 6:
+                import warnings
+                warnings.warn(
+                    f"Voxel index '{index_str}' is {len(index_str)} digits (expected 6). "
+                    f"Using dynamic parsing."
+                )
+            
+            # Dynamic parsing: Try to infer format
+            if len(remainder) == 4:
+                # Standard ZZPP format
+                axis0_idx = int(remainder[:2])
+                axis1_idx = int(remainder[2:4])
+                format_used = "LLZZPP"
+            elif len(remainder) == 5:
+                # Either ZZZPP or ZZPPP
+                # Heuristic: Phi usually has more voxels (cylindrical)
+                # Try ZZPPP first
+                try:
+                    axis0_idx = int(remainder[:2])
+                    axis1_idx = int(remainder[2:5])
+                    format_used = "LLZZPPP"
+                except:
+                    # Fallback to ZZZPP
+                    axis0_idx = int(remainder[:3])
+                    axis1_idx = int(remainder[3:5])
+                    format_used = "LLZZZPP"
+            else:
+                raise ValueError(
+                    f"Cannot parse WALL voxel index '{index_str}' with {len(remainder)} "
+                    f"digits after layer prefix. Expected 4 or 5."
+                )
+            
+            if len(index_str) > 6:
+                import warnings
+                warnings.warn(f"  → Parsed as {format_used}: axis0={axis0_idx}, axis1={axis1_idx}")
+            
+            return (axis0_idx, axis1_idx)
+        
+        # PIT, BOT: Standard LLYYXX format (legacy, not using auto-geometry yet)
         if len(remainder) == 4:
-            # Standard ZZPP format
             axis0_idx = int(remainder[:2])
             axis1_idx = int(remainder[2:4])
-            format_used = "LLZZPP"
-        elif len(remainder) == 5:
-            # Either ZZZPP or ZZPPP
-            # Heuristic: Phi usually has more voxels (cylindrical)
-            # Try ZZPPP first
-            try:
-                axis0_idx = int(remainder[:2])
-                axis1_idx = int(remainder[2:5])
-                format_used = "LLZZPPP"
-            except:
-                # Fallback to ZZZPP
-                axis0_idx = int(remainder[:3])
-                axis1_idx = int(remainder[3:5])
-                format_used = "LLZZZPP"
+            return (axis0_idx, axis1_idx)
         else:
             raise ValueError(
-                f"Cannot parse voxel index '{index_str}' with {len(remainder)} "
-                f"digits after layer prefix. Expected 4 or 5."
+                f"Cannot parse {region} voxel index '{index_str}'. "
+                f"Expected format LLYYXX (6 digits)."
             )
-        
-        if len(index_str) > 6:
-            import warnings
-            warnings.warn(f"  → Parsed as {format_used}: axis0={axis0_idx}, axis1={axis1_idx}")
-        
-        return (axis0_idx, axis1_idx)
     
     def _infer_grid_shape_and_mapping(self, region: str):
         """
         Infer grid shape from voxel indices and create mapping
+        
+        Handles both 0-indexed grids (WALL) and offset grids (TOP).
         
         Args:
             region: 'PIT', 'BOT', 'WALL', 'TOP'
@@ -421,20 +481,36 @@ class voxelDataset:
             coords = self._parse_voxel_index(key, region)
             parsed_coords.append(coords)
         
-        # Determine grid dimensions
+        # Determine grid dimensions and offsets
         axis0_coords = [c[0] for c in parsed_coords]
         axis1_coords = [c[1] for c in parsed_coords]
         
-        n_axis0 = max(axis0_coords) + 1  # Assuming 0-indexed
-        n_axis1 = max(axis1_coords) + 1
+        axis0_min = min(axis0_coords)
+        axis0_max = max(axis0_coords)
+        axis1_min = min(axis1_coords)
+        axis1_max = max(axis1_coords)
         
-        # Create mapping: original voxel list index → grid coordinates
+        # Grid dimensions (inclusive range)
+        n_axis0 = axis0_max - axis0_min + 1
+        n_axis1 = axis1_max - axis1_min + 1
+        
+        print(f"  Axis 0: min={axis0_min}, max={axis0_max}, n={n_axis0}")
+        print(f"  Axis 1: min={axis1_min}, max={axis1_max}, n={n_axis1}")
+        
+        # Create mapping: original voxel list index → grid coordinates (normalized to 0)
         # Need to map from unsorted to sorted order
         mapping = {}
         for list_idx in region_indices:
             key = self.voxel_keys[list_idx]
             sorted_idx = region_keys_sorted.index(key)
-            mapping[list_idx] = parsed_coords[sorted_idx]
+            raw_coords = parsed_coords[sorted_idx]
+            
+            # Normalize coordinates to start at 0
+            normalized_coords = (
+                raw_coords[0] - axis0_min,
+                raw_coords[1] - axis1_min
+            )
+            mapping[list_idx] = normalized_coords
         
         return (n_axis0, n_axis1, 1), mapping
     
