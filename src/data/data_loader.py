@@ -207,6 +207,11 @@ class voxelDataset:
         # Build voxel-to-region mapping (once, for efficiency)
         print("\n[Voxel-to-Region Mapping]")
         self.voxel_to_region_idx = np.zeros(len(self.voxel_keys), dtype=np.int32)
+        
+        # Check for merged regions
+        self.merged_regions = config['regions'].get('merged_regions', [])
+        
+        # Initialize region indices (original regions)
         self.region_voxel_indices = {'PIT': [], 'BOT': [], 'WALL': [], 'TOP': []}
         
         for voxel_idx, voxel_key in enumerate(self.voxel_keys):
@@ -231,10 +236,23 @@ class voxelDataset:
             self.region_voxel_indices[region] = np.array(
                 self.region_voxel_indices[region], dtype=np.int32
             )
+
+        # Create merged region indices if needed
+        if self.merged_regions:
+            merged_name = ''.join(self.merged_regions)  # e.g., "PITBOT"
+            merged_indices = []
+            for region in self.merged_regions:
+                merged_indices.extend(self.region_voxel_indices[region].tolist())
+            self.region_voxel_indices[merged_name] = np.array(merged_indices, dtype=np.int32)
+            print(f"  {merged_name}: {len(merged_indices)} voxels (merged from {' + '.join(self.merged_regions)})")
         
-        # Validate voxel counts
+        # Validate voxel counts (skip merged regions, validate later)
         expected = self.region_config['expected_voxel_counts']
         for region, indices in self.region_voxel_indices.items():
+            # Skip validation for merged region names (not in original config)
+            if region not in expected:
+                continue
+            
             actual = len(indices)
             exp = expected[region]
             if actual != exp:
@@ -248,13 +266,31 @@ class voxelDataset:
         self.periodic_axes = {}  # Maps region → list of periodic axes
         self.voxel_to_grid_mapping = {}  # Maps region → {voxel_idx: (axis0, axis1)}
         
+        # Determine which regions to process for geometry
+        regions_to_process = []
         for region in ['PIT', 'BOT', 'WALL', 'TOP']:
-            geo_config = config['geometry'][region]
+            # Skip regions that are merged (process merged version instead)
+            if region in self.merged_regions and region != self.merged_regions[0]:
+                continue
+            
+            # For first merged region, process as merged
+            if region in self.merged_regions and region == self.merged_regions[0]:
+                merged_name = ''.join(self.merged_regions)
+                regions_to_process.append((merged_name, self.merged_regions))
+            else:
+                regions_to_process.append((region, [region]))
+        
+        for region_name, source_regions in regions_to_process:
+            # Use first source region's config for merged regions
+            geo_config = config['geometry'][source_regions[0]]
             
             # Determine periodic axes (region-specific naming)
             periodic = []
             
-            if region == 'TOP':
+            # Check actual region name (not merged name)
+            actual_region = source_regions[0]
+            
+            if actual_region in ['TOP', 'PIT', 'BOT']:
                 # TOP uses cartesian coordinates (y, x)
                 if geo_config.get('periodic_y', False):
                     periodic.append(0)  # Y is axis 0
@@ -271,16 +307,27 @@ class voxelDataset:
             
             if geo_config['use_auto_geometry']:
                 # Auto-infer shape from voxel indices
-                print(f"\n[Auto-Geometry: {region}]")
-                inferred_shape, voxel_mapping = self._infer_grid_shape_and_mapping(region)
+                print(f"\n[Auto-Geometry: {region_name}]")
+                if len(source_regions) > 1:
+                    print(f"  Merging: {' + '.join(source_regions)}")
+                inferred_shape, voxel_mapping = self._infer_grid_shape_and_mapping(region_name, source_regions)
                 
                 # Validate against expected count
-                expected_count = self.region_config['expected_voxel_counts'][region]
-                actual_count = len(self.region_voxel_indices[region])
+                if len(source_regions) > 1:
+                    # Merged region: sum expected counts
+                    expected_count = sum(
+                        self.region_config['expected_voxel_counts'][r] 
+                        for r in source_regions
+                    )
+                    actual_count = len(self.region_voxel_indices[region_name])
+                else:
+                    expected_count = self.region_config['expected_voxel_counts'][region_name]
+                    actual_count = len(self.region_voxel_indices[region_name])
                 
                 # Check if inferred shape matches actual count
-                # Exception: TOP is a sparse grid (donut shape), so grid_size > actual_voxels
-                if region != 'TOP':
+                # Exception: Sparse grids (TOP, PITBOT) allow grid_size > actual_voxels
+                sparse_regions = ['TOP', 'PITBOT']
+                if region_name not in sparse_regions:
                     if inferred_shape[0] * inferred_shape[1] != actual_count:
                         raise ValueError(
                             f"GEOMETRY MISMATCH: {region}\n"
@@ -316,11 +363,11 @@ class voxelDataset:
                     periodic_axes=periodic
                 )
                 
-                self.grid_shapes[region] = inferred_shape
-                config['PAD'][region] = auto_pad
+                self.grid_shapes[region_name] = inferred_shape
+                config['PAD'][region_name] = auto_pad
                 
                 # Store mapping for later use
-                self.voxel_to_grid_mapping[region] = voxel_mapping
+                self.voxel_to_grid_mapping[region_name] = voxel_mapping
                 
                 print(f"  Inferred shape: {inferred_shape}")
                 print(f"  Auto-padding: {auto_pad}")
@@ -328,7 +375,7 @@ class voxelDataset:
                 
             else:
                 # Manual shape from config
-                self.grid_shapes[region] = tuple(geo_config['SHAPE'])
+                self.grid_shapes[region_name] = tuple(geo_config['SHAPE'])
                 
                 # Use legacy padding
                 pad_value = config['model']['padding'].get(region, 0)
@@ -337,9 +384,9 @@ class voxelDataset:
                 # No voxel mapping needed (uses old reshape logic)
                 self.voxel_to_grid_mapping[region] = None
                 
-                print(f"\n[Manual Geometry: {region}]")
-                print(f"  Shape: {self.grid_shapes[region]}")
-                print(f"  Padding: {config['PAD'][region]}")
+                print(f"\n[Manual Geometry: {region_name}]")
+                print(f"  Shape: {self.grid_shapes[region_name]}")
+                print(f"  Padding: {config['PAD'][region_name]}")
         
         # Calculate phi_dim
         base_dim = len(self.active_phi)
@@ -444,33 +491,55 @@ class voxelDataset:
             
             return (axis0_idx, axis1_idx)
         
-        # PIT, BOT: Standard LLYYXX format (legacy, not using auto-geometry yet)
-        if len(remainder) == 4:
-            axis0_idx = int(remainder[:2])
-            axis1_idx = int(remainder[2:4])
+        # PIT, BOT: Standard LLYYXX format
+        if region in ['PIT', 'BOT']:
+            if len(remainder) != 4:
+                raise ValueError(
+                    f"{region} voxel index '{index_str}' must have format LLYYXX (6 digits total). "
+                    f"Got {len(index_str)} digits."
+                )
+            axis0_idx = int(remainder[0:2])  # YY
+            axis1_idx = int(remainder[2:4])  # XX
             return (axis0_idx, axis1_idx)
-        else:
-            raise ValueError(
-                f"Cannot parse {region} voxel index '{index_str}'. "
-                f"Expected format LLYYXX (6 digits)."
-            )
+        
+        # Fallback for unknown regions
+        raise ValueError(
+            f"Cannot parse voxel index '{index_str}' for region '{region}'. "
+            f"Unknown region type."
+        )
     
-    def _infer_grid_shape_and_mapping(self, region: str):
+    def _infer_grid_shape_and_mapping(self, region: str, source_regions: list = None):
         """
         Infer grid shape from voxel indices and create mapping
         
-        Handles both 0-indexed grids (WALL) and offset grids (TOP).
+        Handles both 0-indexed grids (WALL) and offset grids (TOP, PITBOT).
+        For merged regions, combines voxel indices from multiple source regions.
         
         Args:
-            region: 'PIT', 'BOT', 'WALL', 'TOP'
+            region: Target region name ('PIT', 'BOT', 'WALL', 'TOP', 'PITBOT')
+            source_regions: List of source regions to merge (e.g., ['PIT', 'BOT'])
+                           If None, uses [region]
         
         Returns:
             shape: (n_axis0, n_axis1, 1)
             mapping: dict {voxel_list_idx: (axis0, axis1)}
         """
-        # Get all voxel keys for this region
+        # Handle merged regions
+        if source_regions is None:
+            source_regions = [region]
+        
+        # Get all voxel keys for this region (or merged regions)
         region_indices = self.region_voxel_indices[region]
         region_keys = [self.voxel_keys[i] for i in region_indices]
+        
+        # For merged regions, we need to parse using correct region prefix
+        # Build a mapping: voxel_key → source_region
+        voxel_to_source = {}
+        if len(source_regions) > 1:
+            for source_region in source_regions:
+                source_indices = self.region_voxel_indices[source_region]
+                for idx in source_indices:
+                    voxel_to_source[self.voxel_keys[idx]] = source_region
         
         # Sort keys to ensure consistent ordering
         region_keys_sorted = sorted(region_keys)
@@ -478,7 +547,9 @@ class voxelDataset:
         # Parse all indices
         parsed_coords = []
         for key in region_keys_sorted:
-            coords = self._parse_voxel_index(key, region)
+            # For merged regions, use source region for parsing
+            parse_region = voxel_to_source.get(key, region)
+            coords = self._parse_voxel_index(key, parse_region)
             parsed_coords.append(coords)
         
         # Determine grid dimensions and offsets
@@ -551,21 +622,23 @@ class voxelDataset:
         
         return (pad_axis0, pad_axis1)
     
-    def _split_voxels_to_regions(self, voxel_batch: np.ndarray) -> list:
+    def _split_voxels_to_regions(self, voxel_batch: np.ndarray) -> dict:
         """
-        Split voxel array into 4 region arrays and reshape to grids
+        Split voxel array into region grids
+        
+        Handles both individual and merged regions (e.g., PITBOT).
         
         Args:
-            voxel_batch: (batch, 9583) - All voxels
+            voxel_batch: (batch, n_voxels) - All voxels
         
         Returns:
-            List of 4 tensors: [(batch, *shape_pit), (batch, *shape_bot), 
-                                (batch, *shape_wall), (batch, *shape_top)]
+            Dict of region tensors: {'WALL': (batch, ...), 'TOP': ..., 'PITBOT': ...}
         """
         batch_size = voxel_batch.shape[0]
-        region_batches = []
+        region_batches = {}
         
-        for region_name in ['PIT', 'BOT', 'WALL', 'TOP']:
+        # Process regions based on grid_shapes (includes merged regions)
+        for region_name in self.grid_shapes.keys():
             indices = self.region_voxel_indices[region_name]
             region_voxels = voxel_batch[:, indices]  # (batch, n_voxels_region)
             grid_shape = self.grid_shapes[region_name]
@@ -585,7 +658,7 @@ class voxelDataset:
                     if len(region_pos) > 0:
                         grid[:, axis0, axis1, 0] = region_voxels[:, region_pos[0]]
                 
-                region_batches.append(grid)
+                region_batches[region_name] = grid
                 
             else:
                 # Legacy: Simple reshape (manual geometry)
@@ -601,7 +674,7 @@ class voxelDataset:
                 
                 target_shape = (batch_size,) + grid_shape
                 region_grid = region_voxels.reshape(target_shape)
-                region_batches.append(region_grid)
+                region_batches[region_name] = region_grid
         
         return region_batches
 
@@ -646,15 +719,16 @@ class voxelDataset:
                 # Split voxels into 4 regions
                 voxel_regions = self._split_voxels_to_regions(target_chunk_normalized)
                 
-                # Yield single samples (CaloScore format)
+                # Yield single samples
                 for i in range(phi_chunk_normalized.shape[0]):
+                    # Build voxel dict (dynamic regions)
+                    voxel_dict = {
+                        region: voxel_regions[region][i]
+                        for region in voxel_regions.keys()
+                    }
+                    
                     yield (
-                        {
-                            'PIT': voxel_regions[0][i],
-                            'BOT': voxel_regions[1][i],
-                            'WALL': voxel_regions[2][i],
-                            'TOP': voxel_regions[3][i]
-                        },  # List of 4 region grids
+                        voxel_dict,
                         region_chunk_normalized[i],    # area_hits
                         phi_chunk_normalized[i]        # cond
                     )
@@ -878,14 +952,14 @@ class voxelDataset:
         Returns:
             tf.data.Dataset yielding (voxel_areas_list, area_hits, cond)
         """
-        # Define output signature (CaloScore compatible)
+        # Define output signature (dynamic based on grid_shapes)
+        voxel_spec = {
+            region: tf.TensorSpec(shape=shape, dtype=tf.float32)
+            for region, shape in self.grid_shapes.items()
+        }
+        
         output_signature = (
-            {
-                'PIT': tf.TensorSpec(shape=self.grid_shapes['PIT'], dtype=tf.float32),
-                'BOT': tf.TensorSpec(shape=self.grid_shapes['BOT'], dtype=tf.float32),
-                'WALL': tf.TensorSpec(shape=self.grid_shapes['WALL'], dtype=tf.float32),
-                'TOP': tf.TensorSpec(shape=self.grid_shapes['TOP'], dtype=tf.float32)
-            },
+            voxel_spec,
             tf.TensorSpec(shape=(4,), dtype=tf.float32),
             tf.TensorSpec(shape=(self.phi_dim,), dtype=tf.float32)
         )

@@ -33,23 +33,44 @@ if __name__ == '__main__':
 
     # Filter active regions
     active_regions = config['training'].get('active_regions', {}).get('enabled', ['PIT', 'BOT', 'WALL', 'TOP'])
-    config['LAYER_NAMES'] = active_regions
-    config['ALL_REGIONS'] = ['PIT', 'BOT', 'WALL', 'TOP']  # Für data_loader
+    
+    # Check for merged regions
+    merged_regions = config['regions'].get('merged_regions', [])
+    
+    # Build LAYER_NAMES (U-Net names)
+    if set(merged_regions).issubset(set(active_regions)):
+        # Replace merged regions with single combined name
+        layer_names = [r for r in active_regions if r not in merged_regions]
+        layer_names.append('PITBOT')  # Add merged name
+        layer_names.sort()  # Keep consistent order
+    else:
+        layer_names = active_regions
+    
+    config['LAYER_NAMES'] = layer_names
+    config['ALL_REGIONS'] = ['PIT', 'BOT', 'WALL', 'TOP']  # Original regions for data_loader
+    
+    print(f"[Model Architecture] U-Nets: {config['LAYER_NAMES']}")
+    if merged_regions:
+        print(f"[Merged Regions] {' + '.join(merged_regions)} → PITBOT")
 
     # Grid shapes (will be set by data_loader based on geometry config)
     config['SHAPE_PIT'] = None
     config['SHAPE_BOT'] = None
     config['SHAPE_WALL'] = None
     config['SHAPE_TOP'] = None
+    config['SHAPE_PITBOT'] = None  # For merged PIT+BOT grid
 
     config['num_steps'] = config['diffusion']['num_steps']
     config['ema_decay'] = config['training']['ema_decay']
 
     # Area ratios (für loss weighting)
-    config['AREA_RATIOS'] = {
-        region: config['normalization']['area_ratios'][region]
-        for region in config['LAYER_NAMES']
-    }
+    config['AREA_RATIOS'] = {}
+    for region in config['LAYER_NAMES']:
+        if region == 'PITBOT':
+            # Merged region: sum individual ratios
+            config['AREA_RATIOS'][region] = config['normalization']['area_ratios']['PITBOT']
+        else:
+            config['AREA_RATIOS'][region] = config['normalization']['area_ratios'][region]
     
     # === Hardware Setup ===
     if config['training']['enable_horovod']:

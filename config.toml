@@ -37,7 +37,7 @@ ema_decay = 0.999
 checkpoint_dir = "./checkpoints"
 
 # Event limiting (null = use all events)
-max_events = 100
+max_events = 1000
 
 # Distillation (NICHT IMPLEMENTIERT - nur Struktur)
 enable_distillation = false
@@ -71,16 +71,20 @@ TOP  = [[4, 4], [4, 4]]
 # ============================================================================
 
 [geometry.PIT]
-use_auto_geometry = false
-SHAPE = [36, 36, 1]  # [n_r, n_phi, channels]
-periodic_phi = false  # FIX: Not yet implemented
-periodic_r = false    # FIX: Not yet implemented
+use_auto_geometry = true
+#SHAPE = [36, 36, 1]  # [n_r, n_phi, channels]
+# SHAPE wird automatisch inferiert (merged mit BOT)
+periodic_y = false   # Y-Achse ist nicht periodic
+periodic_x = false   # X-Achse ist nicht periodic
+merged_with = "BOT"  # PIT und BOT teilen sich ein Grid
 
 [geometry.BOT]
-use_auto_geometry = false
-SHAPE = [20, 20, 1]  # [n_r, n_phi, channels]
-periodic_phi = false  # FIX: Not yet implemented
-periodic_r = false    # FIX: Not yet implemented
+use_auto_geometry = true
+#SHAPE = [20, 20, 1]  # [n_r, n_phi, channels]
+# SHAPE wird automatisch inferiert (merged mit PIT)
+periodic_y = false   # Y-Achse ist nicht periodic
+periodic_x = false   # X-Achse ist nicht periodic
+merged_with = "PIT"  # BOT und PIT teilen sich ein Grid
 
 [geometry.WALL]
 use_auto_geometry = true
@@ -134,12 +138,16 @@ PIT = 3.15
 BOT = 1.0
 WALL = 15.99
 TOP = 3.82
+PITBOT = 4.15
 
 [regions]
 pit_prefix = "00"
 bot_prefix = "01"
 top_prefix = "99"
 expected_voxel_counts = { PIT = 1261, BOT = 400, WALL = 6394, TOP = 1528 }
+
+# Merged regions (share same grid)
+merged_regions = ["PIT", "BOT"]  # These regions use combined grid
 
 [training.active_regions]
 # Welche Regionen trainiert werden sollen

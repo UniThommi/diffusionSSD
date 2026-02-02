@@ -64,18 +64,22 @@ class scoreDiffusion(keras.Model):
         self.num_embed = self.config['EMBED']
         self.area_names = self.config['LAYER_NAMES']
         self.num_area = num_area
+
+        # Voxel grid shapes per area: [z_bins, phi_bins, 1]
+        # Build shapes dynamically based on LAYER_NAMES (includes merged regions)
+        self.shapes = {}
+        for area_name in self.area_names:
+            shape_key = f'SHAPE_{area_name}'
+            if shape_key in config:
+                self.shapes[area_name] = config[shape_key]
+            else:
+                raise ValueError(f"Missing shape config for {area_name}: {shape_key}")
+            
         # Separate optimizers (will be set during compile)
         self.area_optimizer = None
         self.voxel_optimizers = {area_name: None for area_name in self.area_names}
         self.active_areas = self.area_names  
 
-        # Voxel grid shapes per area: [z_bins, phi_bins, 1]
-        self.shapes = {
-            'PIT': config['SHAPE_PIT'],
-            'BOT': config['SHAPE_BOT'],
-            'WALL': config['SHAPE_WALL'],
-            'TOP': config['SHAPE_TOP']
-        }
         # Diffusion process parameters
         self.num_steps = self.config["num_steps"]
         self.ema = self.config["ema_decay"]           
