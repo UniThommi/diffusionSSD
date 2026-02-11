@@ -194,7 +194,7 @@ class scoreDiffusion(keras.Model):
         self.ema_area = keras.models.clone_model(self.model_area)
         
         # Print model summaries on rank 0
-        if self.verbose:
+        if self.verbose and config.get('training', {}).get('verbose', False):
             print("\n=== Area Hits Model ===")
             for area_name in self.active_areas:
                 print(f"\n=== {area_name} U-Net ===")

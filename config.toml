@@ -4,7 +4,10 @@
 
 [training]
 # Run identifier (für separate Checkpoint-Ordner)
-run_name = "nc_score_baseline_v1"
+run_name = "nc_score_baseline_GPU_final"
+
+#Logging
+verbose = false  # Set true for detailed logs (warnings, model summaries, step progress)
 
 # Logging & Monitoring
 enable_tensorboard = false
@@ -13,18 +16,20 @@ save_history_json = true
 plot_update_frequency = 10 
 
 # Hardware
-device = "cpu"  # "cpu" or "gpu"
+device = "gpu"  # "cpu" or "gpu"
 enable_horovod = false
+use_mixed_precision = false
+use_multi_gpu = false # noch nicht benutzbar
 
-# Data files
+# Data files (NERSC Doku empfielt Daten auf scratch filesystem aus Performance Gründen)
 data_dir = "/pscratch/sd/t/tbuerger/data/optPhotonSensitiveSurface/MLFormatHomogeneousNCsZylSSD300PMTs"
 train_file = "resum_output_0_train.hdf5"
 val_file = "resum_output_0_validation.hdf5"
 train_val_split = 0.8
 
 # Hyperparameters
-batch_size = 4 # 32 in CaloScore
-num_epochs = 100
+batch_size = 128   # 128
+num_epochs = 100   # 100
 learning_rate = 1e-4
 optimizer = "Adamax"
 use_cosine_decay = true  # learning_rate
@@ -36,8 +41,8 @@ ema_decay = 0.999
 # Checkpointing
 checkpoint_dir = "./checkpoints"
 
-# Event limiting (null = use all events)
-max_events = 1000
+# Event limiting (auskommentiert = use all events)
+max_events = 100000   # max 100000
 
 # Distillation (NICHT IMPLEMENTIERT - nur Struktur)
 enable_distillation = false

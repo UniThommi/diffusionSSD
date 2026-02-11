@@ -453,7 +453,7 @@ class voxelDataset:
         
         # WALL: Dynamic parsing for variable phi/z dimensions
         if region == 'WALL':
-            if len(index_str) > 6:
+            if len(index_str) > 6 and self.config['training'].get('verbose', False):
                 import warnings
                 warnings.warn(
                     f"Voxel index '{index_str}' is {len(index_str)} digits (expected 6). "
@@ -487,8 +487,8 @@ class voxelDataset:
             
             if len(index_str) > 6:
                 import warnings
-                warnings.warn(f"  → Parsed as {format_used}: axis0={axis0_idx}, axis1={axis1_idx}")
-            
+                if self.config['training'].get('verbose', False):
+                    warnings.warn(f"  → Parsed as {format_used}: axis0={axis0_idx}, axis1={axis1_idx}")
             return (axis0_idx, axis1_idx)
         
         # PIT, BOT: Standard LLYYXX format

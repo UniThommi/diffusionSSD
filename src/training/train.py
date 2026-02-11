@@ -15,15 +15,42 @@ import json
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for NERSC
 import matplotlib.pyplot as plt
+import time
 
 print(f"Eager execution: {tf.executing_eagerly()}")
 
 # Reproducibility
 tf.random.set_seed(1234)
 
+# Runtime Report
+def report_time():
+    elapsed = time.perf_counter() - start_time
+
+    h = int(elapsed // 3600)
+    m = int((elapsed % 3600) // 60)
+    s = elapsed % 60
+
+    print("\n" + "=" * 50)
+    print("⏱️  Runtime Report")
+    print("-" * 50)
+    print(f"   Total runtime : {h:02d}:{m:02d}:{s:05.2f}")
+    print("=" * 50 + "\n")
+
 if __name__ == '__main__':
+    # Time Tracking 
+    start_time = time.perf_counter()
     # === Config Loading ===
     config = toml.load('config.toml')
+
+    # Suppress XLA warnings if verbose=false
+    if not config['training'].get('verbose', False):
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+    # Mixed Precision (Optional)
+    if config['training'].get('use_mixed_precision', False):
+        from tensorflow.keras import mixed_precision
+        mixed_precision.set_global_policy('mixed_float16')
+        print("[Mixed Precision] Enabled (float16)")
 
     # Transformiere config für CaloScore
     config['EMBED'] = config['model']['embed_dim']
@@ -108,6 +135,7 @@ if __name__ == '__main__':
     train_file = data_dir / config['training']['train_file']
     val_file = data_dir / config['training']['val_file']
 
+    report_time()
     print("\n=== Loading Data ===")
     print(f"Train: {train_file}")
     print(f"Val: {val_file}")
@@ -128,6 +156,9 @@ if __name__ == '__main__':
     val_data_clean = val_dataset.get_dataset(
         rank=rank, size=size
     ).repeat()
+    # Add Prefetch (NERSC Dokumentation)
+    train_data_clean = train_data_clean.prefetch(tf.data.AUTOTUNE)
+    val_data_clean = val_data_clean.prefetch(tf.data.AUTOTUNE)
 
     # === Hyperparameters ===
     BATCH_SIZE = config['training']['batch_size']
@@ -164,6 +195,7 @@ if __name__ == '__main__':
     train_size = train_dataset.n_events
     val_size = val_dataset.n_events
 
+    report_time()
     print(f"\n=== DEBUG ===")
     print(f"train_dataset.n_events = {train_dataset.n_events}")
     print(f"train_dataset.n_events_total = {train_dataset.n_events_total}")
@@ -201,12 +233,16 @@ if __name__ == '__main__':
 
     num_layer = config['model'].get('num_resnet_layers', 3) ##FIX wird nie benutzt
     
-    model = scoreDiffusion(
-        num_area=num_area, 
-        num_cond=num_cond,
-        config=config
-        )
-    
+    # Multi-GPU Strategy (for NERSC Perlmutter)
+    if config['training'].get('use_multi_gpu', False):
+        strategy = tf.distribute.MirroredStrategy()
+        print(f'[Multi-GPU] Using {strategy.num_replicas_in_sync} GPUs')
+    else:
+        strategy = tf.distribute.get_strategy()  # Default (single device)
+
+    with strategy.scope():
+        model = scoreDiffusion(num_area=num_area, num_cond=num_cond, config=config)
+
     # === Distillation (NOT IMPLEMENTED - Structure only) ===
     if config['training']['enable_distillation']:
         raise NotImplementedError(
@@ -269,6 +305,7 @@ if __name__ == '__main__':
                     self.model.model_voxels[area_name].save_weights(voxel_path)
                 
                 print(f"\n✓ Checkpoint saved (epoch {epoch+1}, {self.monitor}={current_loss:.4f})")
+                report_time()
 
     if rank == 0:
         checkpoint = MultiModelCheckpoint(
@@ -287,16 +324,20 @@ if __name__ == '__main__':
     # === Incremental Plotting ===
     if rank == 0 and config['training'].get('save_training_plots', False):
         class IncrementalPlotter(Callback):
-            def __init__(self, checkpoint_dir, plot_every=10, run_name=""):
+            def __init__(self, checkpoint_dir, plot_every=10, run_name="", model_config=None):
                 super().__init__()
                 self.checkpoint_dir = Path(checkpoint_dir)
                 self.plot_every = plot_every
                 self.run_name = run_name
-                self.epoch_history = {
-                    'loss': [], 'val_loss': [],
-                    'loss_area': [], 'val_loss_layer': [],
-                    'loss_WALL': [], 'val_loss_WALL': []
-                }
+                self.model_config = model_config
+                
+                # Initialize history for all metrics
+                self.epoch_history = {'loss': [], 'val_loss': [], 'loss_area': [], 'val_loss_layer': []}
+                
+                # Add voxel model histories dynamically
+                for area_name in model_config['LAYER_NAMES']:
+                    self.epoch_history[f'loss_{area_name}'] = []
+                    self.epoch_history[f'val_loss_{area_name}'] = []
             
             def on_epoch_end(self, epoch, logs=None):
                 # Append current metrics
@@ -319,81 +360,207 @@ if __name__ == '__main__':
                 if len(self.epoch_history['loss']) == 0:
                     return
                 
-                fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-                
                 suffix = "_final" if final else "_progress"
                 title_suffix = " (Final)" if final else f" (Epoch {len(self.epoch_history['loss'])})"
-                
-                fig.suptitle(f"Training History - {self.run_name}{title_suffix}", 
-                            fontsize=14, fontweight='bold')
-                
                 epochs = range(1, len(self.epoch_history['loss']) + 1)
                 
-                # Total Loss
+                # === 1. Overview Plot (Total + ResNet) ===
+                fig_overview, axes = plt.subplots(2, 2, figsize=(14, 10))
+                fig_overview.suptitle(f"Training Overview - {self.run_name}{title_suffix}", 
+                                     fontsize=14, fontweight='bold')
+                
+                # Total Loss (top left)
                 axes[0, 0].plot(epochs, self.epoch_history['loss'], 
-                            label='Train', linewidth=2, marker='o', markersize=3)
+                            label='Train', linewidth=2, marker='o', markersize=2, 
+                            color='#1f77b4')  # Blue
                 axes[0, 0].plot(epochs, self.epoch_history['val_loss'], 
-                            label='Val', linewidth=2, marker='s', markersize=3)
-                axes[0, 0].set_xlabel('Epoch')
-                axes[0, 0].set_ylabel('Total Loss')
-                axes[0, 0].set_title('Total Loss')
-                axes[0, 0].legend()
+                            label='Val', linewidth=2, marker='s', markersize=2,
+                            color='#ff7f0e')  # Orange
+                axes[0, 0].set_yscale('log')  # Total Loss logarithmic
+                axes[0, 0].set_xlabel('Epoch', fontsize=11)
+                axes[0, 0].set_ylabel('Total Loss', fontsize=11)
+                axes[0, 0].set_title('Total Loss (ResNet + U-Nets weighted)', fontweight='bold')
+                axes[0, 0].legend(fontsize=10)
                 axes[0, 0].grid(True, alpha=0.3)
                 
-                # Area Loss
+                # ResNet Area Loss (top right)
                 axes[0, 1].plot(epochs, self.epoch_history['loss_area'], 
-                            label='Train', linewidth=2, marker='o', markersize=3)
+                            label='Train', linewidth=2, marker='o', markersize=2,
+                            color='#2ca02c')  # Green
                 axes[0, 1].plot(epochs, self.epoch_history['val_loss_layer'], 
-                            label='Val', linewidth=2, marker='s', markersize=3)
-                axes[0, 1].set_xlabel('Epoch')
-                axes[0, 1].set_ylabel('Area Loss')
-                axes[0, 1].set_title('Area Hits Loss')
-                axes[0, 1].legend()
+                            label='Val', linewidth=2, marker='s', markersize=2,
+                            color='#d62728')  # Red
+                axes[0, 1].set_yscale('log')  # ResNet Area Loss logarithmic
+                axes[0, 1].set_xlabel('Epoch', fontsize=11)
+                axes[0, 1].set_ylabel('Area Loss', fontsize=11)
+                axes[0, 1].set_title('ResNet: Area Hits (4D vector)', fontweight='bold')
+                axes[0, 1].legend(fontsize=10)
                 axes[0, 1].grid(True, alpha=0.3)
                 
-                # Voxel Loss (WALL)
-                axes[1, 0].plot(epochs, self.epoch_history['loss_WALL'], 
-                            label='Train', linewidth=2, marker='o', markersize=3)
-                axes[1, 0].plot(epochs, self.epoch_history['val_loss_WALL'], 
-                            label='Val', linewidth=2, marker='s', markersize=3)
-                axes[1, 0].set_xlabel('Epoch')
-                axes[1, 0].set_ylabel('Voxel Loss')
-                axes[1, 0].set_title('WALL Voxel Loss')
-                axes[1, 0].legend()
-                axes[1, 0].grid(True, alpha=0.3)
-                
-                # Best Epoch Info
+                # Summary Statistics (bottom left)
+                axes[1, 0].axis('off')
                 best_epoch = int(np.argmin(self.epoch_history['val_loss']))
                 best_val_loss = self.epoch_history['val_loss'][best_epoch]
                 
-                axes[1, 1].axis('off')
-                info_text = f"""
-                Best Epoch: {best_epoch + 1}
-                Best Val Loss: {best_val_loss:.4f}
+                summary_text = f"""Loss Composition:
+                Total = ResNet Loss + Σ(U-Net Losses × weights)
+
+                Area Weights:"""
+                for area_name in self.model_config['LAYER_NAMES']:
+                    weight = self.model_config['AREA_RATIOS'][area_name]
+                    summary_text += f"\n  • {area_name}: {weight:.3f}"
                 
+                summary_text += f"""
+
+                Best Epoch: {best_epoch + 1} / {len(self.epoch_history['loss'])}
+                Best Val Loss: {best_val_loss:.4f}
+
                 Current Metrics:
                 Train Loss: {self.epoch_history['loss'][-1]:.4f}
-                Val Loss: {self.epoch_history['val_loss'][-1]:.4f}
-                
-                Total Epochs: {len(self.epoch_history['loss'])}
+                Val Loss:   {self.epoch_history['val_loss'][-1]:.4f}
                 """
-                axes[1, 1].text(0.1, 0.5, info_text, fontsize=12, 
-                            verticalalignment='center', family='monospace',
-                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                
+                axes[1, 0].text(0.05, 0.5, summary_text, fontsize=11, 
+                              verticalalignment='center', family='monospace',
+                              bbox=dict(boxstyle='round', facecolor='#fffacd', 
+                                       edgecolor='gray', linewidth=1.5, alpha=0.9))
+                
+                # Loss Components Breakdown (bottom right)
+                axes[1, 1].axis('off')
+                current_epoch = len(self.epoch_history['loss'])
+                
+                breakdown_text = f"""Current Loss Breakdown (Epoch {current_epoch}):
+
+                ResNet (Area):
+                Train: {self.epoch_history['loss_area'][-1]:.4f}
+                Val:   {self.epoch_history['val_loss_layer'][-1]:.4f}
+
+                U-Nets (Voxels):"""
+                
+                for area_name in self.model_config['LAYER_NAMES']:
+                    train_loss = self.epoch_history[f'loss_{area_name}'][-1]
+                    val_loss = self.epoch_history[f'val_loss_{area_name}'][-1]
+                    breakdown_text += f"\n  {area_name}:"
+                    breakdown_text += f"\n    Train: {train_loss:.4f}"
+                    breakdown_text += f"\n    Val:   {val_loss:.4f}"
+                
+                axes[1, 1].text(0.05, 0.5, breakdown_text, fontsize=10,
+                              verticalalignment='center', family='monospace',
+                              bbox=dict(boxstyle='round', facecolor='#e6f2ff',
+                                       edgecolor='gray', linewidth=1.5, alpha=0.9))
                 
                 plt.tight_layout()
-                plot_path = self.checkpoint_dir / f'training_history{suffix}.png'
-                plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-                plt.close(fig)  # CRITICAL: Free memory
+                overview_path = self.checkpoint_dir / f'overview{suffix}.png'
+                plt.savefig(overview_path, dpi=150, bbox_inches='tight')
+                plt.close(fig_overview)
+                
+                # === 2. U-Nets Detailed Plot ===
+                n_unets = len(self.model_config['LAYER_NAMES'])
+                n_cols = 2
+                n_rows = (n_unets + 1) // 2  # Ceiling division
+                
+                fig_unets, axes_unets = plt.subplots(n_rows, n_cols, 
+                                                     figsize=(14, 5 * n_rows))
+                fig_unets.suptitle(f"U-Net Losses - {self.run_name}{title_suffix}",
+                                  fontsize=14, fontweight='bold')
+                
+                # Flatten axes for easier indexing
+                if n_unets == 1:
+                    axes_unets = np.array([axes_unets])
+                axes_flat = axes_unets.flatten()
+                
+                # Color pairs (train, val) for each U-Net
+                color_pairs = [
+                    ('#1f77b4', '#ff7f0e'),  # Blue / Orange
+                    ('#2ca02c', '#d62728'),  # Green / Red
+                    ('#9467bd', '#e377c2'),  # Purple / Pink
+                    ('#8c564b', '#bcbd22'),  # Brown / Yellow-green
+                ]
+                
+                for idx, area_name in enumerate(self.model_config['LAYER_NAMES']):
+                    ax = axes_flat[idx]
+                    train_color, val_color = color_pairs[idx % len(color_pairs)]
+                    
+                    ax.plot(epochs, self.epoch_history[f'loss_{area_name}'],
+                           label='Train', linewidth=2, marker='o', markersize=2,
+                           color=train_color)
+                    ax.plot(epochs, self.epoch_history[f'val_loss_{area_name}'],
+                           label='Val', linewidth=2, marker='s', markersize=2,
+                           color=val_color)
+                    ax.set_yscale('log')                    
+                    ax.set_xlabel('Epoch', fontsize=11)
+                    ax.set_ylabel('Loss (weighted)', fontsize=11)
+                    
+                    weight = self.model_config['AREA_RATIOS'][area_name]
+                    ax.set_title(f'{area_name} (weight={weight:.3f})', fontweight='bold')
+                    ax.legend(fontsize=10)
+                    ax.grid(True, alpha=0.3)
+                
+                # Hide unused subplots
+                for idx in range(n_unets, len(axes_flat)):
+                    axes_flat[idx].axis('off')
+                
+                plt.tight_layout()
+                unets_path = self.checkpoint_dir / f'unets{suffix}.png'
+                plt.savefig(unets_path, dpi=150, bbox_inches='tight')
+                plt.close(fig_unets)
+                
+                # === 3. Individual Model Plots (unchanged) ===
+                # ResNet plot
+                fig_resnet, ax = plt.subplots(1, 1, figsize=(8, 6))
+                ax.plot(epochs, self.epoch_history['loss_area'], 
+                       label='Train', linewidth=2, marker='o', markersize=3,
+                       color='#2ca02c')
+                ax.plot(epochs, self.epoch_history['val_loss_layer'], 
+                       label='Val', linewidth=2, marker='s', markersize=3,
+                       color='#d62728')
+                ax.set_yscale('log')
+                ax.set_xlabel('Epoch', fontsize=12)
+                ax.set_ylabel('Loss', fontsize=12)
+                ax.set_title(f'ResNet: Area Hits - {self.run_name}{title_suffix}', 
+                           fontsize=13, fontweight='bold')
+                ax.legend(fontsize=11)
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                resnet_path = self.checkpoint_dir / f'resnet{suffix}.png'
+                plt.savefig(resnet_path, dpi=150, bbox_inches='tight')
+                plt.close(fig_resnet)
+                
+                # U-Net individual plots
+                for idx, area_name in enumerate(self.model_config['LAYER_NAMES']):
+                    train_color, val_color = color_pairs[idx % len(color_pairs)]
+                    
+                    fig_unet, ax = plt.subplots(1, 1, figsize=(8, 6))
+                    ax.plot(epochs, self.epoch_history[f'loss_{area_name}'], 
+                           label='Train', linewidth=2, marker='o', markersize=3,
+                           color=train_color)
+                    ax.plot(epochs, self.epoch_history[f'val_loss_{area_name}'], 
+                           label='Val', linewidth=2, marker='s', markersize=3,
+                           color=val_color)
+                    ax.set_yscale('log')
+                    ax.set_xlabel('Epoch', fontsize=12)
+                    ax.set_ylabel('Loss (weighted)', fontsize=12)
+                    
+                    weight = self.model_config['AREA_RATIOS'][area_name]
+                    ax.set_title(f'{area_name} Voxel Loss (weight={weight:.3f}) - {self.run_name}{title_suffix}',
+                               fontsize=13, fontweight='bold')
+                    ax.legend(fontsize=11)
+                    ax.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    unet_path = self.checkpoint_dir / f'unet_{area_name}{suffix}.png'
+                    plt.savefig(unet_path, dpi=150, bbox_inches='tight')
+                    plt.close(fig_unet)
                 
                 if not final:
-                    print(f"  → Plot updated: {plot_path}")
+                    n_plots = 2 + 1 + len(self.model_config['LAYER_NAMES'])  # overview + unets + resnet + individual unets
+                    print(f"  → Saved {n_plots} plots (overview, unets, resnet, {len(self.model_config['LAYER_NAMES'])} individual)")
         
         plot_freq = config['training'].get('plot_update_frequency', 10)
         incremental_plotter = IncrementalPlotter(
             checkpoint_dir=str(checkpoint_folder),
             plot_every=plot_freq,
-            run_name=config['training']['run_name']
+            run_name=config['training']['run_name'],
+            model_config=config
         )
         callbacks.append(incremental_plotter)
         print(f"✓ Incremental plotting enabled (every {plot_freq} epochs)")
@@ -416,20 +583,27 @@ if __name__ == '__main__':
     print("\n" + "="*80)
     print("STARTING TRAINING")
     print("="*80 + "\n")
+    report_time()
+    
+    # Verbose: 2=one line per epoch (minimal), 1=progress bar (detailed)
+    verbose_level = 1 if config['training'].get('verbose', False) else 2
+    if rank != 0:
+        verbose_level = 0  # Multi-GPU: nur rank 0 printet
     
     history = model.fit(
         train_data_clean.batch(BATCH_SIZE),
         epochs=NUM_EPOCHS,
-        steps_per_epoch=int(train_size / BATCH_SIZE),  # ← Korrigiert: Keine train_frac mehr!
+        steps_per_epoch=int(train_size / BATCH_SIZE),
         validation_data=val_data_clean.batch(BATCH_SIZE),
-        validation_steps=int(val_size / BATCH_SIZE),  # ← Korrigiert
-        verbose=1 if rank == 0 else 0,
+        validation_steps=int(val_size / BATCH_SIZE),
+        verbose=verbose_level,
         callbacks=callbacks
     )   
     
     print("\n" + "="*80)
     print("TRAINING COMPLETE")
     print("="*80)
+    report_time()
 
     # === Save Training History ===
     if rank == 0:
@@ -457,3 +631,4 @@ if __name__ == '__main__':
         print(f"✓ Best epoch info saved: {best_epoch_path}")
         
         print("\n✓ All outputs saved successfully")
+        report_time()

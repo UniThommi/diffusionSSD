@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
-checkpoints_cpu/
 *.pt
 *.pth
 *.h5
@@ -8,7 +7,10 @@ checkpoints_cpu/
 *.hdf5
 *.json
 *.txt
-src/optuna*
 *.png
+
+checkpoints_cpu/
 src/training_logs
 logs
+tests/
+runOnNERSC/
