@@ -292,18 +292,6 @@ if __name__ == '__main__':
             if not self.save_best_only or current_loss < self.best_loss:
                 self.best_loss = current_loss
                 
-                # Save Area Model
-                area_path = os.path.join(self.checkpoint_dir, 'area_model_best.weights.h5')
-                self.model.model_area.save_weights(area_path)
-                
-                # Save Voxel Models
-                for area_name in self.model.active_areas:
-                    voxel_path = os.path.join(
-                        self.checkpoint_dir, 
-                        f'voxel_{area_name}_best.weights.h5'
-                    )
-                    self.model.model_voxels[area_name].save_weights(voxel_path)
-
                 # Save EMA weights (used for generation)
                 ema_area_path = os.path.join(self.checkpoint_dir, 'ema_area_model_best.weights.h5')
                 self.model.ema_area.save_weights(ema_area_path)
@@ -315,7 +303,7 @@ if __name__ == '__main__':
                     )
                     self.model.ema_voxels[area_name].save_weights(ema_voxel_path)
                 
-                print(f"\n✓ Checkpoint saved (epoch {epoch+1}, {self.monitor}={current_loss:.4f}) [Training + EMA weights]")
+                print(f"\n✓ Checkpoint saved (epoch {epoch+1}, {self.monitor}={current_loss:.4f}) [EMA weights]")
                 report_time()
 
     if rank == 0:
