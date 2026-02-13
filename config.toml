@@ -133,10 +133,9 @@ r_cylinder = 4300.0
 z_min = -5000.0
 z_max = 3920.0
 angle_max = 6.283185307
-E_max = 40000.0
+E_max = 50000.0
 gamma_count_max = 20.0
-region_hit_max_global = 128.0
-voxel_hit_max = 128.0
+voxel_hit_max = 150
 
 [normalization.area_ratios]
 PIT = 3.15
