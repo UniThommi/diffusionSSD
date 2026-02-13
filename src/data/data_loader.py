@@ -985,32 +985,31 @@ class voxelDataset:
         return ds
     
     def denormalize_predictions(self, voxels_normalized, areas_normalized):
-        """
-        Reverse normalization after model inference
+        # 1. Denormalize area hits: inverse of _normalize_region_targets
+        #    Normalisierung war: region_raw / voxel_hit_max
+        areas_raw = areas_normalized * self.norm_config['voxel_hit_max']
+        areas_raw = np.clip(areas_raw, 0, None)
         
-        Args:
-            voxels_normalized: List of 4 region grids (normalized)
-            areas_normalized: (batch, 4) - normalized area hits
+        # 2. Denormalize voxels: inverse of _normalize_target
+        #    Normalisierung war: voxel_raw / area_hits_raw
+        #    Region order in areas: [pit, bot, wall, top]
+        region_order = ['pit', 'bot', 'wall', 'top']
         
-        Returns:
-            voxels_raw, areas_raw - in original hit counts
-        """
-        # 1. Denormalize areas
-        area_ratios = np.array([
-            self.norm_config['area_ratios']['pit'],
-            self.norm_config['area_ratios']['bot'],
-            self.norm_config['area_ratios']['wall'],
-            self.norm_config['area_ratios']['top']
-        ])
-        
-        areas_raw = areas_normalized * self.norm_config['region_hit_max_global'] * area_ratios
-        
-        # 2. Denormalize voxels (multiply by area hits)
-        voxels_raw = []
-        for region_idx, region_name in enumerate(['pit', 'bot', 'wall', 'top']):
-            voxel_grid = voxels_normalized[region_idx]  # (batch, *grid_shape)
-            area_hits = areas_raw[:, region_idx:region_idx+1, None, None, None]  # Broadcasting shape
-            voxel_raw = voxel_grid * area_hits
-            voxels_raw.append(voxel_raw)
+        voxels_raw = {}
+        for region_name, grid in voxels_normalized.items():
+            # Determine which area(s) this region maps to
+            if region_name == 'PITBOT':
+                # Merged: sum of pit + bot area hits
+                area_total = areas_raw[:, 0] + areas_raw[:, 1]
+            else:
+                region_idx = region_order.index(region_name.lower())
+                area_total = areas_raw[:, region_idx]
+            
+            # Broadcast area_total to grid shape: (batch,) → (batch, 1, 1, 1)
+            n_spatial_dims = len(grid.shape) - 1  # exclude batch dim
+            area_broadcast = area_total.reshape((-1,) + (1,) * n_spatial_dims)
+            
+            voxel_raw = grid * area_broadcast
+            voxels_raw[region_name] = np.clip(voxel_raw, 0, None)
         
         return voxels_raw, areas_raw

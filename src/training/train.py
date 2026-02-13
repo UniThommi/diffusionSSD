@@ -303,8 +303,19 @@ if __name__ == '__main__':
                         f'voxel_{area_name}_best.weights.h5'
                     )
                     self.model.model_voxels[area_name].save_weights(voxel_path)
+
+                # Save EMA weights (used for generation)
+                ema_area_path = os.path.join(self.checkpoint_dir, 'ema_area_model_best.weights.h5')
+                self.model.ema_area.save_weights(ema_area_path)
                 
-                print(f"\n✓ Checkpoint saved (epoch {epoch+1}, {self.monitor}={current_loss:.4f})")
+                for area_name in self.model.active_areas:
+                    ema_voxel_path = os.path.join(
+                        self.checkpoint_dir,
+                        f'ema_voxel_{area_name}_best.weights.h5'
+                    )
+                    self.model.ema_voxels[area_name].save_weights(ema_voxel_path)
+                
+                print(f"\n✓ Checkpoint saved (epoch {epoch+1}, {self.monitor}={current_loss:.4f}) [Training + EMA weights]")
                 report_time()
 
     if rank == 0:
@@ -332,7 +343,7 @@ if __name__ == '__main__':
                 self.model_config = model_config
                 
                 # Initialize history for all metrics
-                self.epoch_history = {'loss': [], 'val_loss': [], 'loss_area': [], 'val_loss_layer': []}
+                self.epoch_history = {'loss': [], 'val_loss': [], 'loss_area': [], 'val_loss_area': []}
                 
                 # Add voxel model histories dynamically
                 for area_name in model_config['LAYER_NAMES']:
@@ -387,7 +398,7 @@ if __name__ == '__main__':
                 axes[0, 1].plot(epochs, self.epoch_history['loss_area'], 
                             label='Train', linewidth=2, marker='o', markersize=2,
                             color='#2ca02c')  # Green
-                axes[0, 1].plot(epochs, self.epoch_history['val_loss_layer'], 
+                axes[0, 1].plot(epochs, self.epoch_history['val_loss_area'], 
                             label='Val', linewidth=2, marker='s', markersize=2,
                             color='#d62728')  # Red
                 axes[0, 1].set_yscale('log')  # ResNet Area Loss logarithmic
@@ -433,7 +444,7 @@ if __name__ == '__main__':
 
                 ResNet (Area):
                 Train: {self.epoch_history['loss_area'][-1]:.4f}
-                Val:   {self.epoch_history['val_loss_layer'][-1]:.4f}
+                Val:   {self.epoch_history['val_loss_area'][-1]:.4f}
 
                 U-Nets (Voxels):"""
                 
@@ -489,10 +500,9 @@ if __name__ == '__main__':
                            color=val_color)
                     ax.set_yscale('log')                    
                     ax.set_xlabel('Epoch', fontsize=11)
-                    ax.set_ylabel('Loss (weighted)', fontsize=11)
+                    ax.set_ylabel('Loss (MSE)', fontsize=11)
                     
-                    weight = self.model_config['AREA_RATIOS'][area_name]
-                    ax.set_title(f'{area_name} (weight={weight:.3f})', fontweight='bold')
+                    ax.set_title(f'{area_name} (unweighted MSE)', fontweight='bold')
                     ax.legend(fontsize=10)
                     ax.grid(True, alpha=0.3)
                 
@@ -511,7 +521,7 @@ if __name__ == '__main__':
                 ax.plot(epochs, self.epoch_history['loss_area'], 
                        label='Train', linewidth=2, marker='o', markersize=3,
                        color='#2ca02c')
-                ax.plot(epochs, self.epoch_history['val_loss_layer'], 
+                ax.plot(epochs, self.epoch_history['val_loss_area'],
                        label='Val', linewidth=2, marker='s', markersize=3,
                        color='#d62728')
                 ax.set_yscale('log')
@@ -539,10 +549,9 @@ if __name__ == '__main__':
                            color=val_color)
                     ax.set_yscale('log')
                     ax.set_xlabel('Epoch', fontsize=12)
-                    ax.set_ylabel('Loss (weighted)', fontsize=12)
+                    ax.set_ylabel('Loss (MSE)', fontsize=12)
                     
-                    weight = self.model_config['AREA_RATIOS'][area_name]
-                    ax.set_title(f'{area_name} Voxel Loss (weight={weight:.3f}) - {self.run_name}{title_suffix}',
+                    ax.set_title(f'{area_name} Voxel Loss (unweighted MSE) - {self.run_name}{title_suffix}',
                                fontsize=13, fontweight='bold')
                     ax.legend(fontsize=11)
                     ax.grid(True, alpha=0.3)

@@ -370,11 +370,11 @@ class scoreDiffusion(keras.Model):
                 losses = tf.square(score - v)
                 loss_voxel = tf.reduce_mean(losses)
 
-                # Weight loss by area size (larger areas get more weight)
+                # Weight loss by area size only for total Loss
                 area_weight = self.config['AREA_RATIOS'][area_name]
                 weighted_loss = loss_voxel * area_weight
 
-                self.loss_voxel_trackers[area_name].update_state(weighted_loss)
+                self.loss_voxel_trackers[area_name].update_state(loss_voxel)
                 total_voxel_loss += weighted_loss
             
             # Update voxel model weights
@@ -443,11 +443,11 @@ class scoreDiffusion(keras.Model):
             losses = tf.square(score - v)
             loss_voxel = tf.reduce_mean(losses)
             
-            # Area-weighted loss
+            # Area-weighted loss nur für Gesamtloss
             area_weight = self.config['AREA_RATIOS'][area_name]
             weighted_loss = loss_voxel * area_weight
             
-            self.loss_voxel_trackers[area_name].update_state(weighted_loss)
+            self.loss_voxel_trackers[area_name].update_state(loss_voxel)
             total_voxel_loss += weighted_loss
         
         self.loss_tracker.update_state(total_voxel_loss + loss_area)
@@ -455,7 +455,7 @@ class scoreDiffusion(keras.Model):
         
         results = {
             "loss": self.loss_tracker.result(),
-            "loss_layer": self.loss_area_tracker.result(),
+            "loss_area": self.loss_area_tracker.result(),
         }
         results.update({
             f"loss_{name}": tracker.result() 
