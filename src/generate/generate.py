@@ -43,6 +43,41 @@ import numpy as np
 import toml
 
 
+def _load_mapping(file_path: str) -> dict:
+    """Load JSON mapping file."""
+    with open(file_path, "r") as f:
+        return json.load(f)
+
+def _remap_material_ids_to_global(
+    glob_mapping_path: str, local_mat_map: dict, local_ids: np.ndarray
+) -> np.ndarray:
+    """Remap local material IDs to global IDs."""
+    glob_map = _load_mapping(glob_mapping_path)
+    local_ids = np.array(local_ids)
+    mapping_dict = {}
+    for local_id in np.unique(local_ids):
+        local_name = local_mat_map[local_id]
+        if local_name not in glob_map:
+            raise RuntimeError(f"Material '{local_name}' not in global mapping")
+        mapping_dict[local_id] = glob_map[local_name]
+    return np.vectorize(mapping_dict.get)(local_ids).astype(np.float32)
+
+
+def _remap_volume_ids_to_global(
+    glob_mapping_path: str, local_vol_map: dict, local_ids: np.ndarray
+) -> np.ndarray:
+    """Remap local volume IDs to global IDs."""
+    glob_map = _load_mapping(glob_mapping_path)
+    local_ids = np.array(local_ids)
+    mapping_dict = {}
+    for local_id in np.unique(local_ids):
+        local_name = local_vol_map[local_id]
+        local_name = "noVolume" if local_name == "" else local_name
+        if local_name not in glob_map:
+            raise RuntimeError(f"Volume '{local_name}' not in global mapping")
+        mapping_dict[local_id] = glob_map[local_name]
+    return np.vectorize(mapping_dict.get)(local_ids).astype(np.float32)
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -181,8 +216,26 @@ def extract_nc_events(sim_files: List[str], config: dict) -> dict:
             dist_top = z_max - z_mm
 
             # NC properties
-            mat_id = np.array(nc_group["nC_material_id"]["pages"]).astype(np.float32)
-            vol_id = np.array(nc_group["nC_phys_vol_id"]["pages"]).astype(np.float32)
+            # NC properties (local IDs → global IDs)
+            local_mat_ids = np.array(nc_group["nC_material_id"]["pages"])
+            local_vol_ids = np.array(nc_group["nC_phys_vol_id"]["pages"])
+
+            # Build local→global mapping from per-file material/volume tables
+            mat_names = [x.decode() for x in f["hit/materials/materialNames"]["pages"][:]]
+            mat_ids_table = f["hit/materials/materialsID"]["pages"][:]
+            local_mat_map = dict(zip(mat_ids_table, mat_names))
+
+            vol_names = [x.decode() for x in f["hit/physVolumes/physVolumeNames"]["pages"][:]]
+            vol_ids_table = f["hit/physVolumes/physVolumesID"]["pages"][:]
+            local_vol_map = dict(zip(vol_ids_table, vol_names))
+
+            mat_id = _remap_material_ids_to_global(
+                config["mapping"]["material_mapping_file"], local_mat_map, local_mat_ids
+            )
+            vol_id = _remap_volume_ids_to_global(
+                config["mapping"]["volume_mapping_file"], local_vol_map, local_vol_ids
+            )
+
             n_gamma = np.array(nc_group["nC_gamma_amount"]["pages"]).astype(np.float32)
             e_gamma_tot = np.array(nc_group["nC_gamma_total_energy_in_keV"]["pages"])
 
@@ -211,34 +264,25 @@ def extract_nc_events(sim_files: List[str], config: dict) -> dict:
             # Radial momentum per gamma: p_r = (px*x + py*y) / r
             # Average over active gammas (E > 0)
             n_events = len(evtid)
-            p_mean_r = np.zeros(n_events, dtype=np.float64)
-            p_mean_z = np.zeros(n_events, dtype=np.float64)
-
-            for i in range(n_events):
-                gamma_es = [g1_e[i], g2_e[i], g3_e[i], g4_e[i]]
-                gamma_pxs = [g1_px[i], g2_px[i], g3_px[i], g4_px[i]]
-                gamma_pys = [g1_py[i], g2_py[i], g3_py[i], g4_py[i]]
-                gamma_pzs = [g1_pz[i], g2_pz[i], g3_pz[i], g4_pz[i]]
-
-                r_val = r_mm[i]
-                count = 0
-                sum_pr = 0.0
-                sum_pz = 0.0
-
-                for j in range(4):
-                    if gamma_es[j] > 0:
-                        # Radial projection: p_r = (px*x + py*y) / r
-                        if r_val > 0:
-                            pr = (gamma_pxs[j] * x_mm[i] + gamma_pys[j] * y_mm[i]) / r_val
-                        else:
-                            pr = 0.0
-                        sum_pr += pr
-                        sum_pz += gamma_pzs[j]
-                        count += 1
-
-                if count > 0:
-                    p_mean_r[i] = sum_pr / count
-                    p_mean_z[i] = sum_pz / count
+            
+            # Stack gamma data: (n_events, 4)
+            gamma_es = np.stack([g1_e, g2_e, g3_e, g4_e], axis=1)
+            gamma_pxs = np.stack([g1_px, g2_px, g3_px, g4_px], axis=1)
+            gamma_pys = np.stack([g1_py, g2_py, g3_py, g4_py], axis=1)
+            gamma_pzs = np.stack([g1_pz, g2_pz, g3_pz, g4_pz], axis=1)
+            
+            # Radial projection: p_r = (px*x + py*y) / r
+            r_safe = np.where(r_mm > 0, r_mm, 1.0)
+            pr_per_gamma = (gamma_pxs * x_mm[:, None] + gamma_pys * y_mm[:, None]) / r_safe[:, None]
+            pr_per_gamma = np.where(r_mm[:, None] > 0, pr_per_gamma, 0.0)
+            
+            # Mask active gammas (E > 0)
+            active_mask = gamma_es > 0  # (n_events, 4)
+            count = active_mask.sum(axis=1)  # (n_events,)
+            count_safe = np.where(count > 0, count, 1.0)
+            
+            p_mean_r = np.where(count > 0, (pr_per_gamma * active_mask).sum(axis=1) / count_safe, 0.0)
+            p_mean_z = np.where(count > 0, (gamma_pzs * active_mask).sum(axis=1) / count_safe, 0.0)
 
             # Deduplicate by (evtid, track_id) - should already be unique
             # but verify just in case
@@ -404,7 +448,8 @@ def normalize_phi(phi_data: dict, config: dict) -> np.ndarray:
         mat_id_to_name = {}
         for name, mid in mat_map_raw.items():
             if isinstance(mid, int):
-                mat_id_to_name[mid] = name
+                final_name = "noMaterial" if name == "" else name
+                mat_id_to_name[mid] = final_name
 
         mat_names_sorted = sorted(set(mat_id_to_name.values()))
         mat_name_to_idx = {n: i for i, n in enumerate(mat_names_sorted)}
@@ -698,26 +743,43 @@ def run_inference(
 
     print(f"\n=== Generating {n_events:,} events in {n_batches} batches ===")
     t_start = time.time()
+    batch_times = []
 
     for batch_idx in range(n_batches):
+        t_batch = time.time()
         start = batch_idx * batch_size
         end = min(start + batch_size, n_events)
         cond_batch = tf.constant(phi_normalized[start:end], dtype=tf.float32)
 
-        # Generate via model (uses EMA weights internally)
         voxels_batch, area_hits_batch = model.generate(cond_batch)
+
+        # Force GPU sync für ehrliche Zeitmessung
+        _ = area_hits_batch[0].numpy()
 
         area_hits_list.append(area_hits_batch)
         for area_name in model.active_areas:
             voxel_grids[area_name].append(voxels_batch[area_name])
 
-        if (batch_idx + 1) % 10 == 0 or batch_idx == n_batches - 1:
+        dt = time.time() - t_batch
+        batch_times.append(dt)
+
+        if batch_idx < 6 or (batch_idx + 1) % 10 == 0 or batch_idx == n_batches - 1:
             elapsed = time.time() - t_start
             rate = (end) / elapsed
             eta = (n_events - end) / rate if rate > 0 else 0
-            print(f"  Batch {batch_idx + 1}/{n_batches} "
-                  f"({end}/{n_events}) - "
-                  f"{rate:.0f} events/s, ETA: {eta:.0f}s")
+            print(f"  Batch {batch_idx}/{n_batches} "
+                f"dt={dt:.2f}s | "
+                f"({end}/{n_events}) - "
+                f"{rate:.0f} events/s, ETA: {eta:.0f}s")
+
+    # Summary
+    print(f"\nBatch timing summary:")
+    print(f"  Batch 0 (warmup/tracing): {batch_times[0]:.2f}s")
+    if len(batch_times) > 1:
+        steady = batch_times[1:]
+        print(f"  Steady-state (batch 1+): mean={np.mean(steady):.2f}s, "
+            f"std={np.std(steady):.2f}s, "
+            f"min={np.min(steady):.2f}s, max={np.max(steady):.2f}s")
 
     # Concatenate
     area_hits_norm = np.concatenate(area_hits_list, axis=0)  # (n_events, 4)
@@ -758,36 +820,12 @@ def run_inference(
 # =============================================================================
 
 def remap_grids_to_voxels(
-    voxel_grids: dict,
-    grid_to_voxel: dict,
-    voxel_to_grid: dict,
-    voxel_keys: List[str],
-    region_cfg: dict,
-    merged_regions: List[str],
-) -> Tuple[dict, dict]:
-    """
-    Remap generated grids back to individual voxel hit arrays.
-
-    Only physical voxels (those in voxel_json) get values.
-    Padding positions are ignored.
-
-    Args:
-        voxel_grids: {region: (n_events, n_axis0, n_axis1, 1)}
-        grid_to_voxel: {region: {(a0, a1): voxel_key}}
-        voxel_to_grid: {region: {voxel_key: (a0, a1)}}
-        voxel_keys: Full sorted list of voxel keys
-        region_cfg: config['regions']
-        merged_regions: List of merged region names
-
-    Returns:
-        voxel_hits: {voxel_key: (n_events,) float32}
-        region_hits_from_voxels: {'pit': (n_events,), ...} summed from voxels
-    """
-    n_events = None
-
-    # Determine which region grid each voxel belongs to
-    def get_grid_region(voxel_key: str) -> str:
-        """Map voxel key to grid region name."""
+    voxel_grids, grid_to_voxel, voxel_to_grid,
+    voxel_keys, region_cfg, merged_regions,
+):
+    """Vectorized grid-to-voxel remapping."""
+    
+    def get_grid_region(voxel_key):
         if voxel_key.startswith(region_cfg["pit_prefix"]):
             base = "PIT"
         elif voxel_key.startswith(region_cfg["bot_prefix"]):
@@ -796,33 +834,36 @@ def remap_grids_to_voxels(
             base = "TOP"
         else:
             base = "WALL"
-
-        # Check if this region is merged
         if merged_regions and base in merged_regions:
-            return "".join(merged_regions)  # e.g. "PITBOT"
+            return "".join(merged_regions)
         return base
 
-    voxel_hits = {}
-    region_sums = {"pit": None, "bot": None, "wall": None, "top": None}
-
+    # Group voxels by grid region for batch extraction
+    region_groups = {}  # {grid_region: [(voxel_key, a0, a1), ...]}
     for voxel_key in voxel_keys:
         grid_region = get_grid_region(voxel_key)
-        grid = voxel_grids[grid_region]
-
-        if n_events is None:
-            n_events = grid.shape[0]
-
-        # Look up grid position for this voxel
         mapping = voxel_to_grid[grid_region]
-        if voxel_key not in mapping:
-            raise RuntimeError(
-                f"Voxel {voxel_key} not found in grid mapping for {grid_region}"
-            )
-
         a0, a1 = mapping[voxel_key]
-        voxel_hits[voxel_key] = grid[:, a0, a1, 0]  # (n_events,)
+        if grid_region not in region_groups:
+            region_groups[grid_region] = []
+        region_groups[grid_region].append((voxel_key, a0, a1))
 
-    # Compute region sums from voxels
+    # Extract all voxels per region in one vectorized operation
+    voxel_hits = {}
+    for grid_region, entries in region_groups.items():
+        grid = voxel_grids[grid_region]  # (n_events, h, w, 1)
+        keys = [e[0] for e in entries]
+        a0s = np.array([e[1] for e in entries])
+        a1s = np.array([e[2] for e in entries])
+        
+        # Single fancy-index operation: (n_events, n_voxels_in_region)
+        extracted = grid[:, a0s, a1s, 0]
+        
+        for i, key in enumerate(keys):
+            voxel_hits[key] = extracted[:, i]
+
+    # Compute region sums
+    region_sums = {"pit": None, "bot": None, "wall": None, "top": None}
     for voxel_key, hits in voxel_hits.items():
         if voxel_key.startswith(region_cfg["pit_prefix"]):
             region = "pit"
@@ -832,9 +873,8 @@ def remap_grids_to_voxels(
             region = "top"
         else:
             region = "wall"
-
         if region_sums[region] is None:
-            region_sums[region] = np.zeros(n_events, dtype=np.float32)
+            region_sums[region] = np.zeros(hits.shape[0], dtype=np.float32)
         region_sums[region] += hits
 
     return voxel_hits, region_sums
@@ -982,24 +1022,32 @@ def main():
             print("  Device: CPU (no GPUs found)")
 
     # --- Discover files ---
+    t_step = time.time()
     print("\n[2/7] Discovering simulation files...")
     sim_files = discover_sim_files(args.input_dir, args.nested)
     print(f"  Found {len(sim_files)} simulation file(s)")
+    print(f"  ⏱ {time.time() - t_step:.1f}s")
 
     # --- Extract NC events ---
+    t_step = time.time()
     print("\n[3/7] Extracting NC events...")
     phi_data = extract_nc_events(sim_files, config)
+    print(f"  ⏱ {time.time() - t_step:.1f}s")
 
     # --- Normalize phi ---
+    t_step = time.time()
     print("\n[4/7] Normalizing phi parameters...")
     phi_normalized = normalize_phi(phi_data, config)
+    print(f"  ⏱ {time.time() - t_step:.1f}s")
 
     # --- Load voxel geometry & build mappings ---
+    t_step = time.time()
     print("\n[5/7] Loading voxel geometry...")
     voxels_json, voxel_keys = load_voxel_geometry(args.voxel_json)
     grid_shapes, voxel_to_grid, grid_to_voxel = build_grid_mappings(
         voxel_keys, config
     )
+    print(f"  ⏱ {time.time() - t_step:.1f}s")
 
     # --- Prepare config for model ---
     # Mirror train.py config preparation
@@ -1070,14 +1118,20 @@ def main():
         config["PAD"][region_name] = (pad0, pad1)
 
     # --- Load model & generate ---
+    t_step = time.time()
     print("\n[6/7] Loading model and generating...")
+    t_load = time.time()
     model = load_model(config, args.checkpoint_dir)
+    print(f"  Model load: {time.time() - t_load:.1f}s")
     voxel_grids_raw, area_hits_raw = run_inference(
         model, phi_normalized, args.batch_size, config
     )
+    print(f"  ⏱ Total step 6: {time.time() - t_step:.1f}s")
 
     # --- Remap & write output ---
+    t_step = time.time()
     print("\n[7/7] Remapping grids to voxels and writing output...")
+    t_remap = time.time()
     voxel_hits, region_hits_from_voxels = remap_grids_to_voxels(
         voxel_grids_raw,
         grid_to_voxel,
@@ -1087,6 +1141,8 @@ def main():
         merged_regions,
     )
 
+    print(f"  Remap: {time.time() - t_remap:.1f}s")
+    t_write = time.time()
     write_output_hdf5(
         args.output_file,
         phi_data,
@@ -1098,12 +1154,16 @@ def main():
         config,
     )
 
+    print(f"  HDF5 write: {time.time() - t_write:.1f}s")
+    print(f"  ⏱ Total step 7: {time.time() - t_step:.1f}s")
+
     elapsed = time.time() - t_start
     h = int(elapsed // 3600)
     m = int((elapsed % 3600) // 60)
     s = elapsed % 60
     print(f"\nTotal runtime: {h:02d}:{m:02d}:{s:05.2f}")
     print("Done.")
+    print(f"\n{'='*50}")
 
 
 if __name__ == "__main__":

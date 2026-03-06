@@ -43,7 +43,7 @@ class scoreDiffusion(keras.Model):
         """Initialize scoreDiffusion model.
         
         Args:
-            num_areas: Legacy parameter (ignored, computed from config)
+            num_area: Legacy parameter (ignored, computed from config)
             num_cond: Number of conditional features (physics)
             name: Model name
             config: Configuration dict with keys:
@@ -120,7 +120,7 @@ class scoreDiffusion(keras.Model):
             # Extract scalar hit count for this specific area from 4D vector
             area_idx = self.area_names.index(area_name)
             area_hits_scalar = layers.Lambda(
-                lambda x, idx: tf.expand_dims(x[:, idx], -1),
+                lambda x, idx: __import__('tensorflow').expand_dims(x[:, idx], -1),
                 arguments={'idx': area_idx},
                 output_shape=(1,)
             )(inputs_area_hits)
@@ -489,7 +489,7 @@ class scoreDiffusion(keras.Model):
         area_hits = self.DDPMSampler(
             cond, 
             self.ema_area,
-            data_shape=[self.num_areas],
+            data_shape=[self.num_area],
             const_shape=[-1, 1]
         )
 
@@ -501,7 +501,7 @@ class scoreDiffusion(keras.Model):
                 self.ema_voxels[area_name],
                 data_shape=self.shapes[area_name],
                 const_shape=[-1] + [1] * len(self.shapes[area_name]),
-                layer_energy=area_hits  # Condition voxels on total hits
+                area_hits=area_hits  # Condition voxels on total hits
             )
         
         end = time.time()

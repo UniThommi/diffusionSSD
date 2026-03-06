@@ -141,8 +141,13 @@ if __name__ == '__main__':
     print(f"Val: {val_file}")
 
     # Create datasets (mit is_validation Flag)
+    t_step = time.perf_counter()
     train_dataset = voxelDataset(str(train_file), config, is_validation=False)
+    print(f"  ⏱ Train dataset init: {time.perf_counter() - t_step:.1f}s")
+    
+    t_step = time.perf_counter()
     val_dataset = voxelDataset(str(val_file), config, is_validation=True)
+    print(f"  ⏱ Val dataset init: {time.perf_counter() - t_step:.1f}s")
 
     # Update config with inferred shapes from data_loader
     for region in config['LAYER_NAMES']:
@@ -150,15 +155,16 @@ if __name__ == '__main__':
         config[shape_key] = list(train_dataset.grid_shapes[region])
     
     # Get clean datasets (CaloScore style - no noise injection)
+    t_step = time.perf_counter()
     train_data_clean = train_dataset.get_dataset(
         rank=rank, size=size
     ).repeat()
     val_data_clean = val_dataset.get_dataset(
         rank=rank, size=size
     ).repeat()
-    # Add Prefetch (NERSC Dokumentation)
     train_data_clean = train_data_clean.prefetch(tf.data.AUTOTUNE)
     val_data_clean = val_data_clean.prefetch(tf.data.AUTOTUNE)
+    print(f"  ⏱ Dataset pipeline setup: {time.perf_counter() - t_step:.1f}s")
 
     # === Hyperparameters ===
     BATCH_SIZE = config['training']['batch_size']
@@ -167,7 +173,9 @@ if __name__ == '__main__':
     EARLY_STOP = config['training']['early_stop_patience']
 
     print("\n=== Dataset Shape Verification ===")
+    t_step = time.perf_counter()
     sample_batch = next(iter(train_data_clean.batch(BATCH_SIZE)))
+    print(f"  ⏱ First batch (includes data loading): {time.perf_counter() - t_step:.1f}s")
     voxels_batch, area_hits_batch, cond_batch = sample_batch
 
     print(f"Voxel shapes after batching:")
