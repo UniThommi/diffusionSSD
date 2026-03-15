@@ -20,6 +20,7 @@ device = "gpu"  # "cpu" or "gpu"
 enable_horovod = false
 use_mixed_precision = false
 use_multi_gpu = false # noch nicht benutzbar
+data_mode = "hdf5"  # "auto", "ram", "hdf5"
 
 # Data files (NERSC Doku empfielt Daten auf scratch filesystem aus Performance Gründen)
 data_dir = "/pscratch/sd/t/tbuerger/data/optPhotonSensitiveSurface/MLFormatHomogeneousNCsZylSSD300PMTs"
@@ -28,7 +29,7 @@ val_file = "ncscore_output_0_validation.hdf5"
 train_val_split = 0.8
 
 # Hyperparameters
-batch_size = 512   # 128
+batch_size = 200   # 128
 num_epochs = 50   # 100
 learning_rate = 1e-4
 optimizer = "Adamax"
@@ -42,7 +43,7 @@ ema_decay = 0.999
 checkpoint_dir = "./checkpoints"
 
 # Event limiting (auskommentiert = use all events)
-max_events = 1000000   # max 100000
+max_events = 5000000   # max 100000
 
 # Distillation (NICHT IMPLEMENTIERT - nur Struktur)
 enable_distillation = false

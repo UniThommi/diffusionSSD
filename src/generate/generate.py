@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# generate.py
 """
 NC-Score Generative Data Pipeline
 
@@ -35,6 +36,7 @@ import glob
 import os
 import sys
 import time
+import tensorflow as tf
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -115,6 +117,14 @@ def parse_args() -> argparse.Namespace:
         "--device", type=str, default="gpu", choices=["cpu", "gpu"],
         help="Device for inference (default: gpu)"
     )
+    parser.add_argument(
+        "--max_events", type=int, default=None,
+        help="Maximum number of NC events to generate (default: all)"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for reproducible generation (default: None = non-deterministic)"
+    )
     return parser.parse_args()
 
 
@@ -154,7 +164,7 @@ def discover_sim_files(input_dir: str, nested: bool) -> List[str]:
 # Step 2: Extract NC events from simulation HDF5
 # =============================================================================
 
-def extract_nc_events(sim_files: List[str], config: dict) -> dict:
+def extract_nc_events(sim_files: List[str], config: dict, max_events: Optional[int] = None) -> dict:
     """
     Extract neutron capture events from simulation HDF5 files.
 
@@ -284,16 +294,11 @@ def extract_nc_events(sim_files: List[str], config: dict) -> dict:
             p_mean_r = np.where(count > 0, (pr_per_gamma * active_mask).sum(axis=1) / count_safe, 0.0)
             p_mean_z = np.where(count > 0, (gamma_pzs * active_mask).sum(axis=1) / count_safe, 0.0)
 
-            # Deduplicate by (evtid, track_id) - should already be unique
-            # but verify just in case
-            nc_keys = set()
-            mask = np.ones(n_events, dtype=bool)
-            for i in range(n_events):
-                key = (int(evtid[i]), int(track_id[i]))
-                if key in nc_keys:
-                    mask[i] = False
-                else:
-                    nc_keys.add(key)
+            # Vectorized deduplication
+            keys = np.stack([evtid, track_id], axis=1)
+            _, unique_indices = np.unique(keys, axis=0, return_index=True)
+            mask = np.zeros(n_events, dtype=bool)
+            mask[unique_indices] = True
 
             n_unique = np.sum(mask)
             if n_unique < n_events:
@@ -334,11 +339,22 @@ def extract_nc_events(sim_files: List[str], config: dict) -> dict:
 
             total_ncs += n_unique
 
-        print(f"  {fpath}: {n_unique} NC events extracted")
+            # Early exit if we have enough events
+            if max_events is not None and total_ncs >= max_events:
+                print(f"  {fpath}: {n_unique} NC events extracted (reached {total_ncs:,} >= {max_events:,}, stopping)")
+                break
+            else:
+                print(f"  {fpath}: {n_unique} NC events extracted")
 
     # Concatenate all files
     result = {k: np.concatenate(v).astype(np.float32) for k, v in fields.items()}
-    print(f"\nTotal NC events: {total_ncs:,}")
+    
+    if max_events is not None and total_ncs > max_events:
+        result = {k: v[:max_events] for k, v in result.items()}
+        print(f"\nTotal NC events: {total_ncs:,} → truncated to {max_events:,}")
+    else:
+        print(f"\nTotal NC events: {total_ncs:,}")
+    
     return result
 
 
@@ -665,7 +681,6 @@ def load_model(config: dict, checkpoint_dir: str):
     Returns:
         Loaded scoreDiffusion model with EMA weights
     """
-    import tensorflow as tf
     from src.models.scoreDiffusion import scoreDiffusion
 
     ckpt = Path(checkpoint_dir)
@@ -711,106 +726,270 @@ def load_model(config: dict, checkpoint_dir: str):
     print(f"  phi_dim: {phi_dim}")
     return model
 
+def generate_area_hits_batched(model, phi_normalized, batch_size):
+    """
+    Stage 1: Generate area_hits for ALL events via ResNet.
+    """
+    n_events = phi_normalized.shape[0]
+    n_batches = (n_events + batch_size - 1) // batch_size
+    area_hits_list = []
+    batch_times = []
+
+    print(f"\n--- Stage 1: ResNet area_hits ({n_batches} batches) ---")
+
+    t_start = time.perf_counter()
+    for batch_idx in range(n_batches):
+        t0 = time.perf_counter()
+        start = batch_idx * batch_size
+        end = min(start + batch_size, n_events)
+        actual_size = end - start
+
+        # Pad last batch to avoid re-tracing with different shape
+        if actual_size < batch_size:
+            padded = np.zeros((batch_size, phi_normalized.shape[1]), dtype=np.float32)
+            padded[:actual_size] = phi_normalized[start:end]
+            cond_batch = tf.constant(padded, dtype=tf.float32)
+        else:
+            cond_batch = tf.constant(phi_normalized[start:end], dtype=tf.float32)
+
+        area_hits = model.DDPMSampler(
+            cond_batch, model.ema_area,
+            data_shape=[model.num_area], const_shape=[-1, 1]
+        )
+        # Trim padding before storing
+        area_hits_list.append(area_hits.numpy()[:actual_size])
+
+        dt = time.perf_counter() - t0
+        batch_times.append(dt)
+
+        if batch_idx < 3 or (batch_idx + 1) % 20 == 0 or batch_idx == n_batches - 1:
+            elapsed = time.perf_counter() - t_start
+            rate = end / elapsed if elapsed > 0 else 0
+            label = " [WARMUP]" if batch_idx == 0 else ""
+            print(f"    Batch {batch_idx:>4d}/{n_batches} dt={dt:.2f}s "
+                  f"({end:,}/{n_events:,}) {rate:.0f} evt/s{label}")
+
+    area_hits_all = np.concatenate(area_hits_list, axis=0)
+
+    total_time = time.perf_counter() - t_start
+    steady = np.array(batch_times[1:]) if len(batch_times) > 1 else np.array(batch_times)
+    print(f"  ResNet total: {total_time:.1f}s "
+          f"(batch 0={batch_times[0]:.2f}s, "
+          f"steady mean={np.mean(steady):.3f}s, std={np.std(steady):.3f}s)")
+
+    return area_hits_all, {"resnet_total": total_time, "resnet_batch_times": batch_times}
+
+
+def generate_voxels_for_area(model, phi_normalized, area_hits_all,
+                              area_name, batch_size):
+    """
+    Stage 2 (per area): Generate voxel grids, skipping events with 0 area hits.
+    """
+    n_events = phi_normalized.shape[0]
+    data_shape = model.shapes[area_name]
+    region_order = ["pit", "bot", "wall", "top"]
+
+    # Determine which events have nonzero hits for this area
+    if area_name == "PITBOT":
+        area_total = area_hits_all[:, 0] + area_hits_all[:, 1]
+    else:
+        region_idx = region_order.index(area_name.lower())
+        area_total = area_hits_all[:, region_idx]
+
+    nonzero_mask = np.abs(area_total) > 1e-6
+    active_indices = np.where(nonzero_mask)[0]
+    n_active = len(active_indices)
+    n_skipped = n_events - n_active
+    skip_pct = n_skipped / n_events * 100 if n_events > 0 else 0
+
+    print(f"\n--- Stage 2: U-Net {area_name} "
+          f"(shape={data_shape}, {n_active:,} active, "
+          f"{n_skipped:,} skipped [{skip_pct:.1f}%]) ---")
+
+    # Pre-allocate full output with zeros
+    voxel_grid_all = np.zeros(
+        (n_events,) + tuple(data_shape), dtype=np.float32
+    )
+
+    if n_active == 0:
+        print(f"  All events skipped for {area_name}!")
+        return voxel_grid_all, {"total": 0.0, "n_active": 0, "n_skipped": n_skipped,
+                                "batch_times": []}
+
+    # Extract active subset
+    phi_active = phi_normalized[active_indices]
+    area_hits_active = area_hits_all[active_indices]
+    phi_dim = phi_normalized.shape[1]
+
+    n_batches = (n_active + batch_size - 1) // batch_size
+    batch_times = []
+
+    t_start = time.perf_counter()
+    voxel_chunks = []
+
+    for batch_idx in range(n_batches):
+        t0 = time.perf_counter()
+        start = batch_idx * batch_size
+        end = min(start + batch_size, n_active)
+        actual_size = end - start
+
+        # Pad last batch to avoid re-tracing with different shape
+        if actual_size < batch_size:
+            padded_cond = np.zeros((batch_size, phi_dim), dtype=np.float32)
+            padded_cond[:actual_size] = phi_active[start:end]
+            padded_ah = np.zeros((batch_size, 4), dtype=np.float32)
+            padded_ah[:actual_size] = area_hits_active[start:end]
+            cond_batch = tf.constant(padded_cond, dtype=tf.float32)
+            ah_batch = tf.constant(padded_ah, dtype=tf.float32)
+        else:
+            cond_batch = tf.constant(phi_active[start:end], dtype=tf.float32)
+            ah_batch = tf.constant(area_hits_active[start:end], dtype=tf.float32)
+
+        voxel_tensor = model.DDPMSampler(
+            cond_batch, model.ema_voxels[area_name],
+            data_shape=data_shape,
+            const_shape=[-1] + [1] * len(data_shape),
+            area_hits=ah_batch
+        )
+        # Trim padding before storing
+        voxel_chunks.append(voxel_tensor.numpy()[:actual_size])
+
+        dt = time.perf_counter() - t0
+        batch_times.append(dt)
+
+        if batch_idx < 3 or (batch_idx + 1) % 20 == 0 or batch_idx == n_batches - 1:
+            elapsed = time.perf_counter() - t_start
+            rate = end / elapsed if elapsed > 0 else 0
+            eta = (n_active - end) / rate if rate > 0 else 0
+            label = " [WARMUP]" if batch_idx == 0 else ""
+            print(f"    Batch {batch_idx:>4d}/{n_batches} dt={dt:.2f}s "
+                  f"({end:,}/{n_active:,}) {rate:.0f} evt/s ETA={eta:.0f}s{label}")
+
+    # Scatter active results back into full array
+    voxel_active = np.concatenate(voxel_chunks, axis=0)
+    voxel_grid_all[active_indices] = voxel_active
+
+    total_time = time.perf_counter() - t_start
+    steady = np.array(batch_times[1:]) if len(batch_times) > 1 else np.array(batch_times)
+    print(f"  U-Net {area_name} total: {total_time:.1f}s "
+          f"(batch 0={batch_times[0]:.2f}s, "
+          f"steady mean={np.mean(steady):.3f}s, std={np.std(steady):.3f}s)")
+
+    return voxel_grid_all, {
+        "total": total_time,
+        "n_active": n_active,
+        "n_skipped": n_skipped,
+        "batch_times": batch_times,
+    }
 
 def run_inference(
     model,
     phi_normalized: np.ndarray,
     batch_size: int,
     config: dict,
-) -> Tuple[dict, np.ndarray]:
+):
     """
-    Run batched model inference.
-
-    Args:
-        model: Loaded scoreDiffusion model
-        phi_normalized: (n_events, phi_dim) normalized conditioning
-        batch_size: Inference batch size
-        config: Full config dict
-
-    Returns:
-        voxel_grids: {region: (n_events, n_axis0, n_axis1, 1)} generated grids
-        area_hits_raw: (n_events, 4) denormalized area hit counts
+    Two-stage inference pipeline with per-stage profiling and zero-skipping.
+    
+    Stage 1: Generate all area_hits via ResNet (batched)
+    Stage 2: For each area, generate voxel grids (batched, zero-skip)
     """
-    import tensorflow as tf
 
     n_events = phi_normalized.shape[0]
     n_batches = (n_events + batch_size - 1) // batch_size
     voxel_hit_max = config["normalization"]["voxel_hit_max"]
 
-    # Collect results
-    area_hits_list = []
-    voxel_grids = {area: [] for area in model.active_areas}
+    # Print inference config
+    print(f"\n{'='*60}")
+    print(f"INFERENCE CONFIG:")
+    print(f"  n_events:      {n_events:,}")
+    print(f"  batch_size:    {batch_size}")
+    print(f"  n_batches:     {n_batches}")
+    print(f"  num_steps:     {model.num_steps}")
+    print(f"  active_areas:  {model.active_areas}")
+    print(f"  shapes:        {model.shapes}")
+    print(f"  num_cond:      {model.num_cond}")
+    fwd_per_batch = model.num_steps
+    fwd_total_resnet = fwd_per_batch * n_batches
+    fwd_total_unet = fwd_per_batch * n_batches * len(model.active_areas)
+    print(f"  ResNet forward passes:  {fwd_total_resnet:,} "
+          f"({model.num_steps} steps × {n_batches} batches)")
+    print(f"  U-Net forward passes (max): {fwd_total_unet:,} "
+          f"({model.num_steps} steps × {n_batches} batches × "
+          f"{len(model.active_areas)} areas)")
+    print(f"  Total max forward passes: {fwd_total_resnet + fwd_total_unet:,}")
+    print(f"{'='*60}")
 
-    print(f"\n=== Generating {n_events:,} events in {n_batches} batches ===")
-    t_start = time.time()
-    batch_times = []
+    t_pipeline = time.perf_counter()
 
-    for batch_idx in range(n_batches):
-        t_batch = time.time()
-        start = batch_idx * batch_size
-        end = min(start + batch_size, n_events)
-        cond_batch = tf.constant(phi_normalized[start:end], dtype=tf.float32)
+    # ===== STAGE 1: All ResNet calls =====
+    area_hits_all, resnet_timings = generate_area_hits_batched(
+        model, phi_normalized, batch_size
+    )
 
-        voxels_batch, area_hits_batch = model.generate(cond_batch)
+    # Print area_hits statistics (useful for zero-skip analysis)
+    print(f"\n  Area hits statistics (raw, before denorm):")
+    for idx, name in enumerate(["pit", "bot", "wall", "top"]):
+        col = area_hits_all[:, idx]
+        n_zero = np.sum(np.abs(col) < 1e-6)
+        print(f"    {name:>6s}: mean={np.mean(col):.4f} std={np.std(col):.4f} "
+              f"min={np.min(col):.4f} max={np.max(col):.4f} "
+              f"n_zero={n_zero} ({n_zero/n_events*100:.1f}%)")
 
-        # Force GPU sync für ehrliche Zeitmessung
-        _ = area_hits_batch[0].numpy()
+    # ===== STAGE 2: U-Net calls per area =====
+    voxel_grids = {}
+    unet_timings = {}
 
-        area_hits_list.append(area_hits_batch)
-        for area_name in model.active_areas:
-            voxel_grids[area_name].append(voxels_batch[area_name])
-
-        dt = time.time() - t_batch
-        batch_times.append(dt)
-
-        if batch_idx < 6 or (batch_idx + 1) % 10 == 0 or batch_idx == n_batches - 1:
-            elapsed = time.time() - t_start
-            rate = (end) / elapsed
-            eta = (n_events - end) / rate if rate > 0 else 0
-            print(f"  Batch {batch_idx}/{n_batches} "
-                f"dt={dt:.2f}s | "
-                f"({end}/{n_events}) - "
-                f"{rate:.0f} events/s, ETA: {eta:.0f}s")
-
-    # Summary
-    print(f"\nBatch timing summary:")
-    print(f"  Batch 0 (warmup/tracing): {batch_times[0]:.2f}s")
-    if len(batch_times) > 1:
-        steady = batch_times[1:]
-        print(f"  Steady-state (batch 1+): mean={np.mean(steady):.2f}s, "
-            f"std={np.std(steady):.2f}s, "
-            f"min={np.min(steady):.2f}s, max={np.max(steady):.2f}s")
-
-    # Concatenate
-    area_hits_norm = np.concatenate(area_hits_list, axis=0)  # (n_events, 4)
     for area_name in model.active_areas:
-        voxel_grids[area_name] = np.concatenate(
-            voxel_grids[area_name], axis=0
+        voxel_grid, timing = generate_voxels_for_area(
+            model, phi_normalized, area_hits_all,
+            area_name, batch_size
         )
+        voxel_grids[area_name] = voxel_grid
+        unet_timings[area_name] = timing
 
-    # Denormalize area hits: area_norm * voxel_hit_max
-    area_hits_raw = area_hits_norm * voxel_hit_max
+    # ===== SUMMARY =====
+    total_pipeline = time.perf_counter() - t_pipeline
+
+    print(f"\n{'='*60}")
+    print(f"PIPELINE SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Stage 1 (ResNet):    {resnet_timings['resnet_total']:.1f}s")
+    for area_name, t in unet_timings.items():
+        skip_info = (f" (skipped {t['n_skipped']:,}/{n_events:,} = "
+                     f"{t['n_skipped']/n_events*100:.1f}%)")
+        print(f"  Stage 2 ({area_name:>6s}):  {t['total']:.1f}s{skip_info}")
+    print(f"  Total pipeline:      {total_pipeline:.1f}s "
+          f"({n_events / total_pipeline:.0f} events/s)")
+    print(f"  Projected for 1M events: "
+          f"{total_pipeline / n_events * 1e6 / 3600:.1f}h")
+
+    # Memory check
+    try:
+        gpu_mem = tf.config.experimental.get_memory_info('GPU:0')
+        print(f"  GPU memory: current={gpu_mem['current']/1e9:.2f}GB "
+              f"peak={gpu_mem['peak']/1e9:.2f}GB")
+    except Exception:
+        pass
+
+    print(f"{'='*60}")
+
+    # ===== Denormalize =====
+    area_hits_raw = area_hits_all * voxel_hit_max
     area_hits_raw = np.clip(area_hits_raw, 0, None)
 
-    # Denormalize voxels: voxel_fraction * area_hits_raw[region]
     region_order = ["pit", "bot", "wall", "top"]
     for area_name in model.active_areas:
         if area_name == "PITBOT":
-            # Merged: pit + bot
             area_total = area_hits_raw[:, 0] + area_hits_raw[:, 1]
         else:
             region_idx = region_order.index(area_name.lower())
             area_total = area_hits_raw[:, region_idx]
 
-        # Broadcast: (n,) → (n, 1, 1, 1)
         n_spatial = len(voxel_grids[area_name].shape) - 1
         area_broadcast = area_total.reshape((-1,) + (1,) * n_spatial)
         voxel_grids[area_name] = voxel_grids[area_name] * area_broadcast
         voxel_grids[area_name] = np.clip(voxel_grids[area_name], 0, None)
-
-    elapsed = time.time() - t_start
-    print(f"\nGeneration complete: {elapsed:.1f}s "
-          f"({n_events / elapsed:.0f} events/s)")
 
     return voxel_grids, area_hits_raw
 
@@ -891,21 +1070,24 @@ def write_output_hdf5(
     config: dict,
 ) -> None:
     """
-    Write ML-format HDF5 file.
+    Write ML-format HDF5 file with 2D matrix layout.
 
-    Args:
-        output_path: Output file path
-        phi_data: Dict of raw phi arrays (all 30 features)
-        voxel_hits: {voxel_key: (n_events,)}
-        region_hits_from_voxels: {'pit': (n_events,), ...}
-        area_hits_from_resnet: (n_events, 4) - ResNet-generated area hits
-        voxels_json: Voxel geometry from JSON
-        voxel_keys: Sorted voxel index list
-        config: Full config dict
+    Structure matches reference format:
+      /phi_columns      (n_phi,)        string labels
+      /phi_matrix       (N, n_phi)      float32
+      /target_columns   (n_voxels,)     string labels
+      /target_matrix    (N, n_voxels)   int32
+      /region_columns   (4,)            string labels
+      /region_matrix    (N, 4)          int32  — summed from voxels
+      /region_matrix_resnet (N, 4)      int32  — direct ResNet output
+      /primaries        ()              int64
+      /mat_map/...      scalar datasets
+      /vol_map/...      scalar datasets
+      /voxels/...       geometry groups
     """
     n_events = len(phi_data["xNC_mm"])
 
-    # PHI_HDF5_ORDER (must match data_loader)
+    # --- Phi matrix ---
     phi_order = [
         "xNC_mm", "yNC_mm", "zNC_mm", "matID", "volID", "#gamma",
         "E_gamma_tot_keV", "r_NC_mm", "phi_NC_rad",
@@ -917,41 +1099,48 @@ def write_output_hdf5(
         "gammaE4_keV", "gammapx4", "gammapy4", "gammapz4",
     ]
 
+    phi_matrix = np.column_stack([phi_data[name] for name in phi_order])
+
+    # --- Target matrix (N, n_voxels) int32 ---
+    target_matrix = np.column_stack(
+        [np.rint(voxel_hits[key]).astype(np.int32) for key in voxel_keys]
+    )
+
+    # --- Region matrices (N, 4) int32 ---
+    region_names = ["pit", "bot", "wall", "top"]
+
+    region_matrix_from_voxels = np.column_stack(
+        [np.rint(region_hits_from_voxels[r]).astype(np.int32) for r in region_names]
+    )
+
+    region_matrix_from_resnet = np.column_stack(
+        [np.rint(area_hits_from_resnet[:, idx]).astype(np.int32)
+         for idx, r in enumerate(region_names)]
+    )
+
+    # --- Write ---
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     with h5py.File(output_path, "w") as f:
 
-        # === /phi/ ===
-        phi_grp = f.create_group("phi")
-        for name in phi_order:
-            phi_grp.create_dataset(name, data=phi_data[name], dtype="float32")
+        # Phi
+        f.create_dataset("phi_columns", data=np.array(phi_order, dtype=object))
+        f.create_dataset("phi_matrix", data=phi_matrix, dtype="float32")
 
-        # === /target/ (generated voxel hits) ===
-        target_grp = f.create_group("target")
-        for key in voxel_keys:
-            target_grp.create_dataset(
-                key, data=voxel_hits[key], dtype="float32"
-            )
+        # Target
+        f.create_dataset("target_columns", data=np.array(voxel_keys, dtype=object))
+        f.create_dataset("target_matrix", data=target_matrix, dtype="int32")
 
-        # === /target_regions/ (summed from voxels) ===
-        region_grp = f.create_group("target_regions")
-        for region_name in ["pit", "bot", "wall", "top"]:
-            region_grp.create_dataset(
-                region_name,
-                data=region_hits_from_voxels[region_name],
-                dtype="float32",
-            )
+        # Regions (cross-check pair)
+        f.create_dataset("region_columns", data=np.array(region_names, dtype=object))
+        f.create_dataset("region_matrix", data=region_matrix_from_voxels, dtype="int32")
+        f.create_dataset("region_matrix_resnet",
+                         data=region_matrix_from_resnet, dtype="int32")
 
-        # === /target_regions_resnet/ (direct ResNet output for comparison) ===
-        resnet_grp = f.create_group("target_regions_resnet")
-        for idx, region_name in enumerate(["pit", "bot", "wall", "top"]):
-            resnet_grp.create_dataset(
-                region_name,
-                data=area_hits_from_resnet[:, idx],
-                dtype="float32",
-            )
+        # Primaries
+        f.create_dataset("primaries", data=n_events)
 
-        # === /mat_map/ ===
+        # Material map
         with open(config["mapping"]["material_mapping_file"], "r") as mf:
             mat_map = json.load(mf)
         mat_grp = f.create_group("mat_map")
@@ -959,7 +1148,7 @@ def write_output_hdf5(
             if isinstance(mid, int):
                 mat_grp.create_dataset(name, data=mid)
 
-        # === /vol_map/ ===
+        # Volume map
         with open(config["mapping"]["volume_mapping_file"], "r") as vf:
             vol_map = json.load(vf)
         vol_grp = f.create_group("vol_map")
@@ -967,28 +1156,37 @@ def write_output_hdf5(
             if isinstance(vid, int):
                 vol_grp.create_dataset(name, data=vid)
 
-        # === /voxels/ (geometry from JSON) ===
+        # Voxel geometry
         voxels_grp = f.create_group("voxels")
         for voxel in voxels_json:
             idx = voxel["index"]
             v_grp = voxels_grp.create_group(idx)
             v_grp.create_dataset(
-                "center", data=np.array(voxel["center"], dtype=np.float32)
-            )
+                "center", data=np.array(voxel["center"], dtype=np.float32))
             corners_grp = v_grp.create_group("corners")
-            corners = np.array(voxel["corners"])  # (8, 3)
+            corners = np.array(voxel["corners"])
             corners_grp.create_dataset("x", data=corners[:, 0])
             corners_grp.create_dataset("y", data=corners[:, 1])
             corners_grp.create_dataset("z", data=corners[:, 2])
             v_grp.create_dataset("layer", data=voxel["layer"])
 
-        # === /primaries ===
-        f.create_dataset("primaries", data=n_events)
-
+    file_size_mb = os.path.getsize(output_path) / 1e6
     print(f"\n✓ Output written: {output_path}")
-    print(f"  Events: {n_events:,}")
-    print(f"  Voxels: {len(voxel_keys)}")
-    print(f"  Size: {os.path.getsize(output_path) / 1e6:.1f} MB")
+    print(f"  Events:        {n_events:,}")
+    print(f"  phi_matrix:    {phi_matrix.shape} float32")
+    print(f"  target_matrix: {target_matrix.shape} int32")
+    print(f"  region_matrix: {region_matrix_from_voxels.shape} int32")
+    print(f"  Voxels:        {len(voxel_keys)}")
+    print(f"  Size:          {file_size_mb:.1f} MB")
+
+    # Cross-check: region sums
+    diff = np.abs(region_matrix_from_voxels - region_matrix_from_resnet)
+    print(f"\n  Region cross-check (voxel_sum vs resnet):")
+    for idx, name in enumerate(region_names):
+        mean_diff = np.mean(diff[:, idx])
+        max_diff = np.max(diff[:, idx])
+        print(f"    {name:>5s}: mean_abs_diff={mean_diff:.2f}, "
+              f"max_abs_diff={max_diff:.0f}")
 
 
 # =============================================================================
@@ -1007,8 +1205,14 @@ def main():
     print("\n[1/7] Loading config...")
     config = toml.load(args.config)
 
+    if args.seed is not None:
+        tf.random.set_seed(args.seed)
+        np.random.seed(args.seed)
+        print(f"  Random seed: {args.seed}")
+    else:
+        print(f"  Random seed: None (non-deterministic)")
+
     # --- Hardware ---
-    import tensorflow as tf
     if args.device == "cpu":
         tf.config.set_visible_devices([], "GPU")
         print("  Device: CPU")
@@ -1031,7 +1235,7 @@ def main():
     # --- Extract NC events ---
     t_step = time.time()
     print("\n[3/7] Extracting NC events...")
-    phi_data = extract_nc_events(sim_files, config)
+    phi_data = extract_nc_events(sim_files, config, max_events=args.max_events)
     print(f"  ⏱ {time.time() - t_step:.1f}s")
 
     # --- Normalize phi ---

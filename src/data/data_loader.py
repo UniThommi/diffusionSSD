@@ -310,28 +310,35 @@ class voxelDataset:
         print(f"  Data mode: {self._data_mode}")
 
     def _select_data_mode(self):
-        """Select RAM or HDF5-streaming mode based on available memory."""
-        # Estimate RAM usage for n_events
+        """Select RAM or HDF5-streaming mode based on config or available memory."""
+        forced_mode = self.config['training'].get('data_mode', 'auto')
+        
         bytes_per_event = (
-            len(self.phi_columns) * 4 +   # phi float32
-            self.n_voxels * 4 +            # targets int32
-            4 * 4                          # regions int32
+            len(self.phi_columns) * 4 +
+            self.n_voxels * 4 +
+            4 * 4
         )
         estimated_ram = self.n_events * bytes_per_event
         available_ram = psutil.virtual_memory().available
-        threshold = available_ram * 0.8
-        
         est_mb = estimated_ram / 1e6
         avail_mb = available_ram / 1e6
-        thresh_mb = threshold / 1e6
         
-        if estimated_ram < threshold:
+        if forced_mode == "hdf5":
+            self._data_mode = "hdf5"
+            print(f"\n[Data Mode] HDF5 streaming (forced, dataset={est_mb:.0f}MB)")
+        elif forced_mode == "ram":
             self._data_mode = "ram"
-            print(f"\n[Data Mode] RAM (dataset={est_mb:.0f}MB, available={avail_mb:.0f}MB)")
+            print(f"\n[Data Mode] RAM (forced, dataset={est_mb:.0f}MB, available={avail_mb:.0f}MB)")
             self._load_into_ram()
         else:
-            self._data_mode = "hdf5"
-            print(f"\n[Data Mode] HDF5 streaming (dataset={est_mb:.0f}MB > threshold={thresh_mb:.0f}MB)")
+            threshold = available_ram * 0.8
+            if estimated_ram < threshold:
+                self._data_mode = "ram"
+                print(f"\n[Data Mode] RAM (dataset={est_mb:.0f}MB, available={avail_mb:.0f}MB)")
+                self._load_into_ram()
+            else:
+                self._data_mode = "hdf5"
+                print(f"\n[Data Mode] HDF5 streaming (dataset={est_mb:.0f}MB > threshold={est_mb:.0f}MB)")
     
     def _load_into_ram(self):
         """Load data directly from HDF5 into RAM."""
