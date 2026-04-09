@@ -12,6 +12,8 @@ No .npy preprocessing cache needed.
 Data loading modes (auto-selected based on available RAM):
   - RAM mode: Full dataset loaded into memory → tf.data.Dataset.from_tensor_slices
   - Memmap mode: HDF5 chunk-streaming → tf.data.Dataset.from_generator
+
+Author: Thomas Buerger (University of Tübingen)
 """
 
 import h5py

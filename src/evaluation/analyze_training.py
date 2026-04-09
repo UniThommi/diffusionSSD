@@ -1,4 +1,4 @@
-# improved_training_config.py - Basierend auf Ihren Ergebnissen optimiert
+# Author: Thomas Buerger (University of Tübingen)
 
 class ImprovedDiffusionTrainer:
     def __init__(self, config_path="/pscratch/sd/t/tbuerger/data/optPhotonSensitiveSurface/resumFormatcurrentDistZylSSD300PMTs/resum_output_0.hdf5"):

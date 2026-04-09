@@ -3,6 +3,8 @@ volume_groups.py
 
 Volume grouping logic for One-Hot encoding
 Basiert auf Regex-Patterns für LEGEND detector geometry
+
+Author: Thomas Buerger (University of Tübingen)
 """
 
 import re
