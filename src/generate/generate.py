@@ -34,6 +34,7 @@ import argparse
 import json
 import glob
 import os
+import re
 import sys
 import time
 import tensorflow as tf
@@ -164,7 +165,20 @@ def discover_sim_files(input_dir: str, nested: bool) -> List[str]:
 # Step 2: Extract NC events from simulation HDF5
 # =============================================================================
 
-def extract_nc_events(sim_files: List[str], config: dict, max_events: Optional[int] = None) -> dict:
+def _parse_run_id(fpath: str) -> int:
+    """Extract integer run ID from a 'run_NNN' component in the file path."""
+    for part in reversed(Path(fpath).parts):
+        m = re.search(r'run[_\-]?(\d+)', part, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def extract_nc_events(
+    sim_files: List[str],
+    config: dict,
+    max_events: Optional[int] = None,
+) -> Tuple[dict, np.ndarray, List[str]]:
     """
     Extract neutron capture events from simulation HDF5 files.
 
@@ -175,8 +189,12 @@ def extract_nc_events(sim_files: List[str], config: dict, max_events: Optional[i
         config: Full config dict
 
     Returns:
-        Dict with keys matching ML-format phi fields, each value is np.ndarray
-        of shape (n_nc_events,)
+        phi_data     : Dict with keys matching ML-format phi fields, each value
+                       is np.ndarray of shape (n_nc_events,)
+        event_ids    : int64 array of shape (N, 2) with columns [run_id, nc_id],
+                       or shape (N, 3) with columns [run_id, muon_id, nc_id] for
+                       muon-seeded simulations.
+        id_columns   : list of column name strings for event_ids.
     """
     norm_cfg = config["normalization"]
     r_cyl = norm_cfg["r_cylinder"]
@@ -198,6 +216,10 @@ def extract_nc_events(sim_files: List[str], config: dict, max_events: Optional[i
     }
 
     total_ncs = 0
+    id_run: List[np.ndarray] = []
+    id_nc: List[np.ndarray] = []
+    id_muon: List[np.ndarray] = []   # only populated for muon-seeded sims
+    is_muon_sim: Optional[bool] = None  # detected from first file
 
     for fpath in sim_files:
         with h5py.File(fpath, "r") as f:
@@ -206,6 +228,10 @@ def extract_nc_events(sim_files: List[str], config: dict, max_events: Optional[i
             # Read NC-level data (pages format)
             evtid = np.array(nc_group["evtid"]["pages"])
             track_id = np.array(nc_group["nC_track_id"]["pages"])
+
+            # Detect simulation type once from the first file
+            if is_muon_sim is None:
+                is_muon_sim = bool(np.any(evtid != track_id))
 
             # Positions (meters → mm)
             x_m = np.array(nc_group["nC_x_position_in_m"]["pages"])
@@ -337,6 +363,13 @@ def extract_nc_events(sim_files: List[str], config: dict, max_events: Optional[i
             fields["p_mean_r"].append(p_mean_r[mask])
             fields["p_mean_z"].append(p_mean_z[mask])
 
+            # Event IDs
+            run_id_val = _parse_run_id(fpath)
+            id_run.append(np.full(n_unique, run_id_val, dtype=np.int64))
+            id_nc.append(track_id[mask].astype(np.int64))
+            if is_muon_sim:
+                id_muon.append(evtid[mask].astype(np.int64))
+
             total_ncs += n_unique
 
             # Early exit if we have enough events
@@ -348,14 +381,30 @@ def extract_nc_events(sim_files: List[str], config: dict, max_events: Optional[i
 
     # Concatenate all files
     result = {k: np.concatenate(v).astype(np.float32) for k, v in fields.items()}
-    
+
+    run_id_arr  = np.concatenate(id_run)
+    nc_id_arr   = np.concatenate(id_nc)
+    if is_muon_sim:
+        muon_id_arr = np.concatenate(id_muon)
+
     if max_events is not None and total_ncs > max_events:
-        result = {k: v[:max_events] for k, v in result.items()}
+        result      = {k: v[:max_events] for k, v in result.items()}
+        run_id_arr  = run_id_arr[:max_events]
+        nc_id_arr   = nc_id_arr[:max_events]
+        if is_muon_sim:
+            muon_id_arr = muon_id_arr[:max_events]
         print(f"\nTotal NC events: {total_ncs:,} → truncated to {max_events:,}")
     else:
         print(f"\nTotal NC events: {total_ncs:,}")
-    
-    return result
+
+    if is_muon_sim:
+        event_ids  = np.stack([run_id_arr, muon_id_arr, nc_id_arr], axis=1)
+        id_columns = ["run_id", "muon_id", "nc_id"]
+    else:
+        event_ids  = np.stack([run_id_arr, nc_id_arr], axis=1)
+        id_columns = ["run_id", "nc_id"]
+
+    return result, event_ids, id_columns
 
 
 # =============================================================================
@@ -1068,11 +1117,15 @@ def write_output_hdf5(
     voxels_json: List[dict],
     voxel_keys: List[str],
     config: dict,
+    event_ids: np.ndarray,
+    event_id_columns: List[str],
 ) -> None:
     """
     Write ML-format HDF5 file with 2D matrix layout.
 
     Structure matches reference format:
+      /event_id_columns (n_id_cols,)    string labels
+      /event_ids        (N, n_id_cols)  int64  — run_id/[muon_id]/nc_id
       /phi_columns      (n_phi,)        string labels
       /phi_matrix       (N, n_phi)      float32
       /target_columns   (n_voxels,)     string labels
@@ -1122,6 +1175,11 @@ def write_output_hdf5(
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     with h5py.File(output_path, "w") as f:
+
+        # Event IDs
+        f.create_dataset("event_id_columns",
+                         data=np.array(event_id_columns, dtype=object))
+        f.create_dataset("event_ids", data=event_ids, dtype="int64")
 
         # Phi
         f.create_dataset("phi_columns", data=np.array(phi_order, dtype=object))
@@ -1235,7 +1293,9 @@ def main():
     # --- Extract NC events ---
     t_step = time.time()
     print("\n[3/7] Extracting NC events...")
-    phi_data = extract_nc_events(sim_files, config, max_events=args.max_events)
+    phi_data, event_ids, event_id_columns = extract_nc_events(
+        sim_files, config, max_events=args.max_events
+    )
     print(f"  ⏱ {time.time() - t_step:.1f}s")
 
     # --- Normalize phi ---
@@ -1356,6 +1416,8 @@ def main():
         voxels_json,
         voxel_keys,
         config,
+        event_ids=event_ids,
+        event_id_columns=event_id_columns,
     )
 
     print(f"  HDF5 write: {time.time() - t_write:.1f}s")

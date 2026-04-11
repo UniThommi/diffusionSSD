@@ -52,16 +52,19 @@ _REGION_COLS = [("PIT", 0), ("BOT", 1), ("WALL", 2), ("TOP", 3)]
 
 def load_hdf5(path: str) -> dict:
     """
-    Load phi_matrix, target_matrix, region_matrix, and target_columns
-    from an ML-format HDF5 file (sim or gen — identical schema).
+    Load phi_matrix, target_matrix, region_matrix, target_columns, and
+    (when present) event_ids / event_id_columns from an ML-format HDF5 file.
 
     Returns
     -------
     dict with:
-        phi_matrix    : (N, 30)   float32 — conditioning features
-        target_matrix : (N, 9583) int32   — voxel hit counts (denormalized)
-        region_matrix : (N, 4)    int32   — [pit, bot, wall, top] hits
-        target_columns: list[str], length 9583 — voxel index strings
+        phi_matrix       : (N, 30)   float32 — conditioning features
+        target_matrix    : (N, 9583) int32   — voxel hit counts (denormalized)
+        region_matrix    : (N, 4)    int32   — [pit, bot, wall, top] hits
+        target_columns   : list[str], length 9583 — voxel index strings
+        event_ids        : (N, k)    int64   — [run_id, (muon_id,) nc_id], or
+                           None if the file predates ID writing.
+        event_id_columns : list[str] of length k, or None.
     """
     with h5py.File(path, "r") as f:
         phi_matrix    = f["phi_matrix"][:]
@@ -71,6 +74,15 @@ def load_hdf5(path: str) -> dict:
             c.decode() if isinstance(c, bytes) else c
             for c in f["target_columns"][:]
         ]
+        if "event_ids" in f:
+            event_ids = f["event_ids"][:]
+            event_id_columns = [
+                c.decode() if isinstance(c, bytes) else c
+                for c in f["event_id_columns"][:]
+            ]
+        else:
+            event_ids        = None
+            event_id_columns = None
 
     n_vox = target_matrix.shape[1]
     if n_vox != 9583:
@@ -79,10 +91,12 @@ def load_hdf5(path: str) -> dict:
             "Ensure this is an ML-format HDF5 from the NC simulation pipeline."
         )
     return {
-        "phi_matrix":     phi_matrix,
-        "target_matrix":  target_matrix,
-        "region_matrix":  region_matrix,
-        "target_columns": target_columns,
+        "phi_matrix":        phi_matrix,
+        "target_matrix":     target_matrix,
+        "region_matrix":     region_matrix,
+        "target_columns":    target_columns,
+        "event_ids":         event_ids,
+        "event_id_columns":  event_id_columns,
     }
 
 
@@ -150,18 +164,12 @@ def build_region_masks(target_columns: list) -> Dict[str, np.ndarray]:
 # Event Pairing
 # =============================================================================
 
-def _phi_key(row: np.ndarray) -> bytes:
-    """Create a hashable key from a phi_matrix row at float32 precision."""
-    return np.round(row.astype(np.float64), 6).astype(np.float32).tobytes()
-
-
 def pair_events(sim: dict, gen: dict) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Match simulation events to generated events by phi_matrix row equality.
+    Match simulation events to generated events by (run_id, nc_id).
 
-    The generated file's phi_matrix is written verbatim from the raw simulation
-    data (no normalization round-trip), so matching is exact at float32 precision.
-    A hash-based approach gives O(N_sim + N_gen) instead of brute-force O(N²).
+    Both files must contain event_ids / event_id_columns datasets written by
+    generate.py.  Raises RuntimeError if either file is missing them.
 
     Returns
     -------
@@ -169,13 +177,38 @@ def pair_events(sim: dict, gen: dict) -> Tuple[np.ndarray, np.ndarray]:
 
     Raises
     ------
-    ValueError if fewer than 10 % of gen events are matched.
+    RuntimeError    if event_ids is missing from either file.
+    ValueError      if fewer than 10 % of gen events are matched.
     """
-    # Build lookup: phi_key → sim row index (-1 marks collision)
+    if sim["event_ids"] is None or gen["event_ids"] is None:
+        missing = []
+        if sim["event_ids"] is None:
+            missing.append("--sim")
+        if gen["event_ids"] is None:
+            missing.append("--gen")
+        raise RuntimeError(
+            f"event_ids missing in: {', '.join(missing)}. "
+            "Re-generate the file(s) with a current version of generate.py "
+            "that writes run_id and nc_id."
+        )
+    return _pair_by_ids(sim, gen)
+
+
+def _pair_by_ids(sim: dict, gen: dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Match events by (run_id, nc_id) tuple."""
+    def _key_cols(ids, cols):
+        run_idx = cols.index("run_id")
+        nc_idx  = cols.index("nc_id")
+        return ids[:, run_idx], ids[:, nc_idx]
+
+    sim_run, sim_nc = _key_cols(sim["event_ids"], sim["event_id_columns"])
+    gen_run, gen_nc = _key_cols(gen["event_ids"], gen["event_id_columns"])
+
+    # Build lookup: (run_id, nc_id) → sim row index (-1 marks collision)
     sim_lookup: dict = {}
     n_collisions = 0
-    for i, row in enumerate(sim["phi_matrix"]):
-        key = _phi_key(row)
+    for i in range(len(sim_run)):
+        key = (int(sim_run[i]), int(sim_nc[i]))
         if key in sim_lookup:
             sim_lookup[key] = -1
             n_collisions += 1
@@ -183,14 +216,14 @@ def pair_events(sim: dict, gen: dict) -> Tuple[np.ndarray, np.ndarray]:
             sim_lookup[key] = i
 
     if n_collisions > 0:
-        pct = n_collisions / len(sim["phi_matrix"]) * 100
-        print(f"  WARNING: {n_collisions} duplicate phi rows in sim ({pct:.2f}%) "
-              "— ambiguous matches excluded.")
+        pct = n_collisions / len(sim_run) * 100
+        print(f"  WARNING: {n_collisions} duplicate (run_id, nc_id) pairs in sim "
+              f"({pct:.2f}%) — ambiguous matches excluded.")
 
     sim_indices, gen_indices = [], []
     n_unmatched = 0
-    for j, row in enumerate(gen["phi_matrix"]):
-        key = _phi_key(row)
+    for j in range(len(gen_run)):
+        key = (int(gen_run[j]), int(gen_nc[j]))
         s = sim_lookup.get(key, None)
         if s is not None and s != -1:
             sim_indices.append(s)
@@ -198,14 +231,14 @@ def pair_events(sim: dict, gen: dict) -> Tuple[np.ndarray, np.ndarray]:
         else:
             n_unmatched += 1
 
-    n_gen     = len(gen["phi_matrix"])
+    n_gen     = len(gen_run)
     n_matched = len(sim_indices)
     if n_matched < 0.1 * n_gen:
         raise ValueError(
-            f"Only {n_matched}/{n_gen} gen events matched ({n_matched/n_gen:.1%}). "
-            "Verify that --sim is the source file used for generation."
+            f"Only {n_matched}/{n_gen} gen events matched ({n_matched/n_gen:.1%}) "
+            "by (run_id, nc_id). Verify that --sim is the source file used for generation."
         )
-    print(f"  Paired {n_matched:,}/{n_gen:,} events "
+    print(f"  Paired {n_matched:,}/{n_gen:,} events by ID "
           f"({n_matched/n_gen:.1%} matched, {n_unmatched} unmatched).")
     return np.array(sim_indices, np.int32), np.array(gen_indices, np.int32)
 
@@ -1118,7 +1151,7 @@ def main() -> None:
     region_masks  = build_region_masks(gen["target_columns"])
 
     # 3. Pair events ──────────────────────────────────────────────────────────
-    print("\n[3/9] Pairing events via phi_matrix matching...")
+    print("\n[3/9] Pairing events...")
     sim_idx, gen_idx = pair_events(sim, gen)
 
     n_matched = len(sim_idx)
