@@ -6,7 +6,6 @@ __pycache__/
 .env
 *.hdf5
 *.json
-*.txt
 *.png
 *.md
 
@@ -15,3 +14,4 @@ src/training_logs
 logs
 tests/
 runOnNERSC/
+checkpoints/

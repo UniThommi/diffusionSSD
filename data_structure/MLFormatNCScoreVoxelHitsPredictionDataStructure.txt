@@ -1,0 +1,14 @@
+=== HDF5 Structure (compressed) ===
+- Group: /  (#entries: 9)
+  - Group: //mat_map  (#entries: 0)
+  - Dataset: //phi_columns  shape=(30,)  dtype=object
+  - Dataset: //phi_matrix  shape=(5000, 30)  dtype=float32
+    Columns (30): ['xNC_mm', 'yNC_mm', 'zNC_mm', 'matID', 'volID', '#gamma', 'E_gamma_tot_keV', 'r_NC_mm', 'phi_NC_rad', 'dist_to_wall_mm', 'dist_to_bot_mm', 'dist_to_top_mm', 'p_mean_r', 'p_mean_z', 'gammaE1_keV', 'gammapx1', 'gammapy1', 'gammapz1', 'gammaE2_keV', 'gammapx2', 'gammapy2', 'gammapz2', 'gammaE3_keV', 'gammapx3', 'gammapy3', 'gammapz3', 'gammaE4_keV', 'gammapx4', 'gammapy4', 'gammapz4']
+  - Dataset: //primaries  shape=()  dtype=int64
+  - Dataset: //region_columns  shape=(4,)  dtype=object
+  - Dataset: //region_matrix  shape=(5000, 4)  dtype=int32
+    Columns (4): ['pit', 'bot', 'wall', 'top']
+  - Dataset: //region_matrix_resnet  shape=(5000, 4)  dtype=int32
+  - Dataset: //target_columns  shape=(9583,)  dtype=object
+  - Dataset: //target_matrix  shape=(5000, 9583)  dtype=int32
+    Columns (9583): ['000013', '000014', '000015', '000016', '000017'] ... and 9578 more
