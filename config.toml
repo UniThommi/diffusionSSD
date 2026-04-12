@@ -136,6 +136,7 @@ z_max = 3920.0
 angle_max = 6.283185307
 E_max = 50000.0
 gamma_count_max = 20.0
+time_max_ns = 10000.0   # upper bound for nC_time_in_ns normalization (adjust if needed)
 voxel_hit_max = 300
 
 [normalization.area_ratios]

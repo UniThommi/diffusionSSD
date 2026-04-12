@@ -48,21 +48,29 @@ class voxelDataset:
 
         # Read structure from HDF5
         with h5py.File(h5_path, "r") as f:
-            if "phi_matrix" not in f or "target_matrix" not in f or "region_matrix" not in f:
+            required_keys = [
+                "phi_matrix", "target_matrix", "region_matrix",
+                "phi_columns", "target_columns", "region_columns",
+            ]
+            missing = [k for k in required_keys if k not in f]
+            if missing:
                 raise ValueError(
-                    "HDF5 must contain 'phi_matrix', 'target_matrix', and 'region_matrix'. "
+                    f"HDF5 is missing required datasets: {missing}. "
                     "Regenerate data with updated post-processing script."
                 )
             self.n_events_total = f["phi_matrix"].shape[0]
             self.n_voxels = f["target_matrix"].shape[1]
-            
+
             # Read column metadata
-            self.phi_columns = [c.decode() if isinstance(c, bytes) else c 
+            self.phi_columns = [c.decode() if isinstance(c, bytes) else c
                                for c in f["phi_columns"][:]]
-            self.voxel_keys = [c.decode() if isinstance(c, bytes) else c 
+            self.voxel_keys = [c.decode() if isinstance(c, bytes) else c
                               for c in f["target_columns"][:]]
-            self.region_columns = [c.decode() if isinstance(c, bytes) else c 
+            self.region_columns = [c.decode() if isinstance(c, bytes) else c
                                   for c in f["region_columns"][:]]
+            # NOTE: the SSD training format also provides a /weights dataset
+            # (per-event importance weights). It is intentionally not used here;
+            # all events are treated as equally weighted during training.
         
         # === EVENT LIMITING ===
         max_events = config['training'].get('max_events', None)
@@ -104,7 +112,8 @@ class voxelDataset:
         self.material_mapping = {}
         for mat_name, mat_id in material_mapping_raw.items():
             if isinstance(mat_id, int):
-                self.material_mapping[mat_id] = mat_name
+                final_name = "noMaterial" if mat_name == "" else mat_name
+                self.material_mapping[mat_id] = final_name
         self.n_materials = len(self.material_mapping)
         print(f"  Loaded {self.n_materials} materials")
         
@@ -318,7 +327,7 @@ class voxelDataset:
         bytes_per_event = (
             len(self.phi_columns) * 4 +
             self.n_voxels * 4 +
-            4 * 4
+            len(self.region_columns) * 4
         )
         estimated_ram = self.n_events * bytes_per_event
         available_ram = psutil.virtual_memory().available
@@ -493,6 +502,7 @@ class voxelDataset:
         h_cyl = z_max - z_min
         angle_max = self.norm_config['angle_max']
         gamma_count_max = self.norm_config['gamma_count_max']
+        time_max_ns = self.norm_config['time_max_ns']
         
         phi_normalized = []
         
@@ -528,6 +538,10 @@ class voxelDataset:
                 normalized = np.mod(raw_values, angle_max) / angle_max
             elif feature_name == '#gamma':
                 normalized = raw_values / gamma_count_max
+            elif feature_name == 'nC_time_in_ns':
+                normalized = raw_values / time_max_ns
+            elif feature_name == 'nC_flag_Ge77':
+                normalized = raw_values  # binary 0/1, already in [0, 1]
             elif feature_name in ['matID', 'volID']:
                 normalized = raw_values
             else:

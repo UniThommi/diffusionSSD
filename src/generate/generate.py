@@ -208,11 +208,12 @@ def extract_nc_events(
         "matID": [], "volID": [],
         "#gamma": [], "E_gamma_tot_keV": [],
         "dist_to_wall_mm": [], "dist_to_bot_mm": [], "dist_to_top_mm": [],
+        "p_mean_r": [], "p_mean_z": [],
+        "nC_time_in_ns": [], "nC_flag_Ge77": [],
         "gammaE1_keV": [], "gammapx1": [], "gammapy1": [], "gammapz1": [],
         "gammaE2_keV": [], "gammapx2": [], "gammapy2": [], "gammapz2": [],
         "gammaE3_keV": [], "gammapx3": [], "gammapy3": [], "gammapz3": [],
         "gammaE4_keV": [], "gammapx4": [], "gammapy4": [], "gammapz4": [],
-        "p_mean_r": [], "p_mean_z": [],
     }
 
     total_ncs = 0
@@ -257,11 +258,13 @@ def extract_nc_events(
             local_vol_ids = np.array(nc_group["nC_phys_vol_id"]["pages"])
 
             # Build local→global mapping from per-file material/volume tables
-            mat_names = [x.decode() for x in f["hit/materials/materialNames"]["pages"][:]]
+            mat_names = [x.decode() if isinstance(x, bytes) else x
+                         for x in f["hit/materials/materialNames"]["pages"][:]]
             mat_ids_table = f["hit/materials/materialsID"]["pages"][:]
             local_mat_map = dict(zip(mat_ids_table, mat_names))
 
-            vol_names = [x.decode() for x in f["hit/physVolumes/physVolumeNames"]["pages"][:]]
+            vol_names = [x.decode() if isinstance(x, bytes) else x
+                         for x in f["hit/physVolumes/physVolumeNames"]["pages"][:]]
             vol_ids_table = f["hit/physVolumes/physVolumesID"]["pages"][:]
             local_vol_map = dict(zip(vol_ids_table, vol_names))
 
@@ -274,6 +277,8 @@ def extract_nc_events(
 
             n_gamma = np.array(nc_group["nC_gamma_amount"]["pages"]).astype(np.float32)
             e_gamma_tot = np.array(nc_group["nC_gamma_total_energy_in_keV"]["pages"])
+            nc_time_ns = np.array(nc_group["nC_time_in_ns"]["pages"])
+            nc_flag_ge77 = np.array(nc_group["nC_flag_Ge77"]["pages"]).astype(np.float32)
 
             # Individual gamma data (top-4 from NC output scheme)
             g1_e = np.array(nc_group["gamma1_E_in_keV"]["pages"])
@@ -344,6 +349,10 @@ def extract_nc_events(
             fields["dist_to_wall_mm"].append(dist_wall[mask])
             fields["dist_to_bot_mm"].append(dist_bot[mask])
             fields["dist_to_top_mm"].append(dist_top[mask])
+            fields["p_mean_r"].append(p_mean_r[mask])
+            fields["p_mean_z"].append(p_mean_z[mask])
+            fields["nC_time_in_ns"].append(nc_time_ns[mask])
+            fields["nC_flag_Ge77"].append(nc_flag_ge77[mask])
             fields["gammaE1_keV"].append(g1_e[mask])
             fields["gammapx1"].append(g1_px[mask])
             fields["gammapy1"].append(g1_py[mask])
@@ -360,8 +369,6 @@ def extract_nc_events(
             fields["gammapx4"].append(g4_px[mask])
             fields["gammapy4"].append(g4_py[mask])
             fields["gammapz4"].append(g4_pz[mask])
-            fields["p_mean_r"].append(p_mean_r[mask])
-            fields["p_mean_z"].append(p_mean_z[mask])
 
             # Event IDs
             run_id_val = _parse_run_id(fpath)
@@ -436,6 +443,7 @@ def normalize_phi(phi_data: dict, config: dict) -> np.ndarray:
     h_cyl = z_max - z_min
     angle_max = norm_cfg["angle_max"]
     gamma_count_max = norm_cfg["gamma_count_max"]
+    time_max_ns = norm_cfg["time_max_ns"]
 
     enable_mat_onehot = onehot_cfg["enable_material_onehot"]
     enable_vol_onehot = onehot_cfg["enable_volume_onehot"]
@@ -490,6 +498,14 @@ def normalize_phi(phi_data: dict, config: dict) -> np.ndarray:
         # Gamma count
         elif feature_name == "#gamma":
             norm = raw / gamma_count_max
+
+        # NC capture time (normalized by time_max_ns)
+        elif feature_name == "nC_time_in_ns":
+            norm = raw / time_max_ns
+
+        # Ge77 capture flag (binary 0/1, already in [0, 1])
+        elif feature_name == "nC_flag_Ge77":
+            norm = raw
 
         # Categorical fallback
         elif feature_name in ["matID", "volID"]:
@@ -755,7 +771,10 @@ def load_model(config: dict, checkpoint_dir: str):
     if onehot_cfg["enable_material_onehot"] and "matID" in active_phi_raw:
         with open(config["mapping"]["material_mapping_file"], "r") as f:
             mat_map = json.load(f)
-        n_mat = len(set(v for v in mat_map.values() if isinstance(v, int)))
+        # Count unique names (after empty-string substitution) — must match normalize_phi()
+        _mat_id_to_name = {mid: ("noMaterial" if name == "" else name)
+                           for name, mid in mat_map.items() if isinstance(mid, int)}
+        n_mat = len(set(_mat_id_to_name.values()))
         phi_dim += n_mat
     if onehot_cfg["enable_volume_onehot"] and "volID" in active_phi_raw:
         raise NotImplementedError("Volume one-hot not implemented in generate.py")
@@ -1146,6 +1165,7 @@ def write_output_hdf5(
         "E_gamma_tot_keV", "r_NC_mm", "phi_NC_rad",
         "dist_to_wall_mm", "dist_to_bot_mm", "dist_to_top_mm",
         "p_mean_r", "p_mean_z",
+        "nC_time_in_ns", "nC_flag_Ge77",
         "gammaE1_keV", "gammapx1", "gammapy1", "gammapz1",
         "gammaE2_keV", "gammapx2", "gammapy2", "gammapz2",
         "gammaE3_keV", "gammapx3", "gammapy3", "gammapz3",
