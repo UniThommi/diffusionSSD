@@ -16,7 +16,7 @@ Metrics
 Usage
 -----
     python src/evaluation/evaluate.py \\
-        --sim  /path/to/sim.hdf5 \\
+        --sim  /path/to/MLFormatSSD.hdf5 \\
         --gen  /path/to/generated.hdf5 \\
         [--output_dir results/] [--n_events 5000] [--seed 42] [--no_plots]
 
