@@ -18,7 +18,8 @@ Usage
     python evaluation/evaluate.py \\
         --sim  /path/to/MLFormatSSD.hdf5 \\
         --gen  /path/to/generated.hdf5 \\
-        [--output_dir results/] [--n_events 5000] [--seed 42] [--no_plots]
+        [--output_dir results/] [--n_events N] [--seed 42]
+        [--no_plots] [--chunk_size 10000]
 
 Author: Thomas Buerger (University of Tübingen)
 """
@@ -58,15 +59,15 @@ def load_hdf5(path: str, load_target: bool = True) -> dict:
     ----------
     path         : Path to the HDF5 file.
     load_target  : If True (default), load the full target_matrix into RAM.
-                   Set to False for large simulation files where only event_ids,
+                   Set to False for large files where only event_ids,
                    region_matrix, and phi_matrix are needed upfront (e.g. to
-                   pair events before loading only the matched rows via
-                   load_target_rows()).
+                   pair events before streaming target_matrix in batches via
+                   the batch loop in main()).
 
     Returns
     -------
     dict with:
-        phi_matrix       : (N, 30)   float32 — conditioning features
+        phi_matrix       : (N, F)    float32 — conditioning features
         target_matrix    : (N, 9583) int32   — voxel hit counts, or None if
                            load_target=False
         region_matrix    : (N, 4)    int32   — [pit, bot, wall, top] hits
@@ -135,9 +136,9 @@ def load_target_rows(path: str, row_indices: np.ndarray) -> np.ndarray:
     -------
     (len(row_indices), 9583) int32 array — rows in the same order as row_indices.
     """
-    sort_order   = np.argsort(row_indices)
-    sorted_idx   = row_indices[sort_order]
-    inv_order    = np.empty_like(sort_order)
+    sort_order = np.argsort(row_indices)
+    sorted_idx = row_indices[sort_order]
+    inv_order  = np.empty_like(sort_order)
     inv_order[sort_order] = np.arange(len(sort_order))
 
     with h5py.File(path, "r") as f:
@@ -303,9 +304,8 @@ def wasserstein_region(
     For each region r, the empirical distribution is the vector of per-event
     total hit counts: sim_region[:, r] and gen_region[:, r].
 
-    W₁(P, Q) = ∫|F_P(x) − F_Q(x)| dx   (Villani 2009, eq. 2.1)
-
-    Units: photon hit counts.
+    Operates on (N, 4) region matrices which are small even at large N and
+    are loaded fully into RAM before the batch loop.
 
     Args
     ----
@@ -335,62 +335,305 @@ def wasserstein_region(
 
 
 # =============================================================================
-# Metric 2 — Per-Voxel Wasserstein
+# Batch Infrastructure
 # =============================================================================
 
-def wasserstein_per_voxel(
-    sim_target: np.ndarray,
-    gen_target: np.ndarray,
+def _find_kmax(
+    sim_path:   str,
+    gen_path:   str,
+    sim_idx:    np.ndarray,
+    gen_idx:    np.ndarray,
+    chunk_size: int,
+) -> int:
+    """
+    First pass: find the global maximum hit count across all matched sim and gen
+    events.  Used to size the per-voxel integer histograms for M2.
+
+    Reads rows in globally sorted order for efficient sequential HDF5 I/O.
+    """
+    N = len(sim_idx)
+    kmax = 0
+
+    sort_s  = np.argsort(sim_idx)
+    sort_g  = np.argsort(gen_idx)
+    s_sorted = sim_idx[sort_s]
+    g_sorted = gen_idx[sort_g]
+
+    with h5py.File(sim_path, "r") as f_sim, h5py.File(gen_path, "r") as f_gen:
+        ds_sim = f_sim["target_matrix"]
+        ds_gen = f_gen["target_matrix"]
+        for start in range(0, N, chunk_size):
+            end  = min(start + chunk_size, N)
+            kmax = max(kmax, int(ds_sim[s_sorted[start:end]].max()))
+            kmax = max(kmax, int(ds_gen[g_sorted[start:end]].max()))
+
+    return kmax
+
+
+def _init_accumulators(
+    n_matched:    int,
+    kmax:         int,
+    region_masks: Dict[str, np.ndarray],
 ) -> dict:
     """
-    Per-voxel statistics comparing sim and gen hit distributions across events.
+    Allocate all arrays that _process_batch fills incrementally.
 
-    For each voxel i, compute W₁(sim_target[:, i], gen_target[:, i]) using
-    the scipy implementation of the 1-D Wasserstein distance.
+    Pre-allocating avoids repeated list.append() and enables direct slice
+    assignment (acc["arr"][start:end] = chunk_result), keeping memory bounded
+    regardless of N.
 
-    Also reports mean/std hit rate and gen/sim ratio per voxel.
+    Memory layout
+    -------------
+    Per-voxel histograms : 2 × (9583, kmax+1) int64  — O(V × K), N-independent
+    Population totals    : 2 × (9583,) float64        — O(V),   N-independent
+    Per-event scalars    : ~20 × (N,) float64          — O(N),   grows with N
+    """
+    V  = 9583
+    K1 = kmax + 1
+    return {
+        # M2: per-voxel integer hit-count histograms
+        "hist_sim":      np.zeros((V, K1), dtype=np.int64),
+        "hist_gen":      np.zeros((V, K1), dtype=np.int64),
 
-    Notes
-    -----
-    - Loop over 9583 voxels at N=5000 events: ~5–30 s.
-    - Voxels with zero hits in both sim and gen: W₁ = 0 (trivially identical).
-    - float64 used throughout to avoid int32 overflow on per-voxel sums.
+        # M3 + M7-pop + spatial profiles: population hit totals (shared)
+        "tot_sim":       np.zeros(V, dtype=np.float64),
+        "tot_gen":       np.zeros(V, dtype=np.float64),
+
+        # M3: per-event center-of-gravity and per-event projection W₁
+        "cog_r_sim":     np.full(n_matched, np.nan),
+        "cog_r_gen":     np.full(n_matched, np.nan),
+        "cog_z_sim":     np.full(n_matched, np.nan),
+        "cog_z_gen":     np.full(n_matched, np.nan),
+        "ev_tot_sim":    np.zeros(n_matched, dtype=np.float64),
+        "ev_tot_gen":    np.zeros(n_matched, dtype=np.float64),
+        "w1_z_ev":       np.full(n_matched, np.nan),
+        "w1_r_ev":       np.full(n_matched, np.nan),
+
+        # M4: per-event support metrics
+        "iou_ev":        np.zeros(n_matched, dtype=np.float64),
+        "prec_ev":       np.zeros(n_matched, dtype=np.float64),
+        "rec_ev":        np.zeros(n_matched, dtype=np.float64),
+        "mismatch_ev":   np.zeros(n_matched, dtype=np.float64),
+        "wmismatch_ev":  np.zeros(n_matched, dtype=np.float64),
+        "iou_ev_r":      {r: np.zeros(n_matched) for r in region_masks},
+        "prec_ev_r":     {r: np.zeros(n_matched) for r in region_masks},
+        "rec_ev_r":      {r: np.zeros(n_matched) for r in region_masks},
+
+        # M5: per-event MSE
+        "mse_ev":        np.zeros(n_matched, dtype=np.float64),
+
+        # M6: per-event Poisson NLL
+        "nll_ev":        np.zeros(n_matched, dtype=np.float64),
+        "nll_ev_r":      {r: np.zeros(n_matched) for r in region_masks},
+        "penalised_sum": 0,   # total penalised (voxel × event) count; ÷N at finalize
+
+        # M7: per-event JS divergence
+        "js_ev":         np.zeros(n_matched, dtype=np.float64),
+        "js_ev_r":       {r: np.zeros(n_matched) for r in region_masks},
+    }
+
+
+def _process_batch(
+    acc:          dict,
+    sc:           np.ndarray,
+    gc:           np.ndarray,
+    chunk_start:  int,
+    r_coords:     np.ndarray,
+    z_coords:     np.ndarray,
+    region_masks: Dict[str, np.ndarray],
+) -> None:
+    """
+    Accumulate statistics for one chunk of matched events into *acc* (in place).
+
+    Parameters
+    ----------
+    acc         : Accumulator dict from _init_accumulators().
+    sc, gc      : (C, 9583) int32 — sim/gen target_matrix rows for this chunk.
+    chunk_start : Index of the first event of this chunk in acc's per-event arrays.
+    r_coords    : (9583,) float64 — radial voxel coordinates [mm].
+    z_coords    : (9583,) float64 — z voxel coordinates [mm].
+    region_masks: Dict of bool masks (9583,) from build_region_masks().
+    """
+    C   = sc.shape[0]
+    V   = sc.shape[1]
+    K   = acc["hist_sim"].shape[1] - 1
+    sl  = slice(chunk_start, chunk_start + C)
+
+    # ── M2: histogram accumulation ────────────────────────────────────────────
+    # Map each (voxel v, hit_count k) pair to a unique linear index v*(K+1)+k,
+    # then use a single np.bincount call over all C×V pairs per chunk.
+    # This avoids a Python loop over 9583 voxels per batch.
+    vox_offsets = np.arange(V, dtype=np.int64) * (K + 1)           # (V,)
+    sc_c = sc.clip(0, K).astype(np.int64)                           # (C, V)
+    gc_c = gc.clip(0, K).astype(np.int64)
+    acc["hist_sim"] += np.bincount(
+        (sc_c + vox_offsets).ravel(), minlength=V * (K + 1)
+    ).reshape(V, K + 1)
+    acc["hist_gen"] += np.bincount(
+        (gc_c + vox_offsets).ravel(), minlength=V * (K + 1)
+    ).reshape(V, K + 1)
+
+    # ── Float arrays shared by M3–M7 ─────────────────────────────────────────
+    sf = sc.astype(np.float64)                                       # (C, V)
+    gf = gc.astype(np.float64)
+
+    # ── M3 + shared: population hit totals ───────────────────────────────────
+    # Also used for M7 population JS and spatial profiles — same arrays.
+    acc["tot_sim"] += sf.sum(axis=0)
+    acc["tot_gen"] += gf.sum(axis=0)
+
+    # ── M3: center-of-gravity and per-event projection W₁ ────────────────────
+    ev_tot_s = sf.sum(axis=1)                                        # (C,)
+    ev_tot_g = gf.sum(axis=1)
+    acc["ev_tot_sim"][sl] = ev_tot_s
+    acc["ev_tot_gen"][sl] = ev_tot_g
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cog_r_s = np.where(ev_tot_s > 0, sf @ r_coords / ev_tot_s, np.nan)
+        cog_r_g = np.where(ev_tot_g > 0, gf @ r_coords / ev_tot_g, np.nan)
+        cog_z_s = np.where(ev_tot_s > 0, sf @ z_coords / ev_tot_s, np.nan)
+        cog_z_g = np.where(ev_tot_g > 0, gf @ z_coords / ev_tot_g, np.nan)
+    acc["cog_r_sim"][sl] = cog_r_s
+    acc["cog_r_gen"][sl] = cog_r_g
+    acc["cog_z_sim"][sl] = cog_z_s
+    acc["cog_z_gen"][sl] = cog_z_g
+
+    # Per-event projection W₁: scipy call per event — O(V log V) each.
+    for i in range(C):
+        if ev_tot_s[i] > 0 and ev_tot_g[i] > 0:
+            gi = chunk_start + i
+            acc["w1_z_ev"][gi] = wasserstein_distance(
+                z_coords, z_coords, u_weights=sf[i], v_weights=gf[i])
+            acc["w1_r_ev"][gi] = wasserstein_distance(
+                r_coords, r_coords, u_weights=sf[i], v_weights=gf[i])
+
+    # ── M4: support metrics ───────────────────────────────────────────────────
+    S        = sc > 0                                                # (C, V) bool
+    G        = gc > 0
+    inter    = (S & G).sum(axis=1).astype(np.float64)
+    union_sz = (S | G).sum(axis=1).astype(np.float64)
+    S_size   = S.sum(axis=1).astype(np.float64)
+    G_size   = G.sum(axis=1).astype(np.float64)
+    sym_diff = (S ^ G).sum(axis=1).astype(np.float64)
+
+    iou      = np.where(union_sz > 0, inter / union_sz, 1.0)
+    precision = np.where(G_size > 0, inter / G_size,
+                         np.where(S_size == 0, 1.0, 0.0))
+    recall   = np.where(S_size > 0, inter / S_size,
+                         np.where(G_size == 0, 1.0, 0.0))
+    mismatch = sym_diff / np.maximum(1.0, S_size)
+
+    total_int = sf + gf
+    w_num     = (total_int * (S ^ G)).sum(axis=1)
+    w_den     = total_int.sum(axis=1)
+    wmismatch = np.where(w_den > 0, w_num / w_den, 0.0)
+
+    acc["iou_ev"][sl]       = iou
+    acc["prec_ev"][sl]      = precision
+    acc["rec_ev"][sl]       = recall
+    acc["mismatch_ev"][sl]  = mismatch
+    acc["wmismatch_ev"][sl] = wmismatch
+
+    for r_name, mask in region_masks.items():
+        S_r = S[:, mask];  G_r = G[:, mask]
+        i_r = (S_r & G_r).sum(axis=1).astype(np.float64)
+        u_r = (S_r | G_r).sum(axis=1).astype(np.float64)
+        s_r = S_r.sum(axis=1).astype(np.float64)
+        g_r = G_r.sum(axis=1).astype(np.float64)
+        acc["iou_ev_r"][r_name][sl]  = np.where(u_r > 0, i_r / u_r, 1.0)
+        acc["prec_ev_r"][r_name][sl] = np.where(g_r > 0, i_r / g_r,
+                                                 np.where(s_r == 0, 1.0, 0.0))
+        acc["rec_ev_r"][r_name][sl]  = np.where(s_r > 0, i_r / s_r,
+                                                 np.where(g_r == 0, 1.0, 0.0))
+
+    # ── M5: MSE ───────────────────────────────────────────────────────────────
+    acc["mse_ev"][sl] = ((sf - gf) ** 2).mean(axis=1)
+
+    # ── M6: Poisson NLL ───────────────────────────────────────────────────────
+    eps     = 1e-6
+    log_gen = np.log(gf + eps)                                       # (C, V)
+    nll_mat = gf - sf * log_gen                                      # (C, V)
+    acc["nll_ev"][sl]     = nll_mat.sum(axis=1)
+    acc["penalised_sum"] += int(((gc == 0) & (sc > 0)).sum())
+    for r_name, mask in region_masks.items():
+        acc["nll_ev_r"][r_name][sl] = nll_mat[:, mask].sum(axis=1)
+
+    # ── M7: Jensen-Shannon divergence ─────────────────────────────────────────
+    s_sum = sf.sum(axis=1, keepdims=True).clip(min=1)
+    g_sum = gf.sum(axis=1, keepdims=True).clip(min=1)
+    sn    = sf / s_sum;  gn = gf / g_sum
+    Mn    = 0.5 * (sn + gn)
+    acc["js_ev"][sl] = (0.5 * rel_entr(sn, Mn).sum(axis=1)
+                      + 0.5 * rel_entr(gn, Mn).sum(axis=1))
+    for r_name, mask in region_masks.items():
+        sr   = sf[:, mask];  gr = gf[:, mask]
+        sr_n = sr / sr.sum(axis=1, keepdims=True).clip(min=1)
+        gr_n = gr / gr.sum(axis=1, keepdims=True).clip(min=1)
+        Mr   = 0.5 * (sr_n + gr_n)
+        acc["js_ev_r"][r_name][sl] = (0.5 * rel_entr(sr_n, Mr).sum(axis=1)
+                                    + 0.5 * rel_entr(gr_n, Mr).sum(axis=1))
+
+
+# =============================================================================
+# Metric 2 — Per-Voxel Wasserstein (histogram-based, exact for integer data)
+# =============================================================================
+
+def wasserstein_per_voxel(acc: dict) -> dict:
+    """
+    Per-voxel W₁ from accumulated integer hit-count histograms.
+
+    For integer-valued data on {0, 1, ..., K} the 1-D Wasserstein distance has
+    the exact closed form:
+
+        W₁(P, Q) = Σ_{k=0}^{K-1} |F_P(k) − F_Q(k)|
+
+    where F_P(k) = P(X ≤ k) is the empirical CDF.  Computing W₁ from the
+    accumulated count histograms is algebraically identical to calling
+    scipy.wasserstein_distance on the raw event columns — no approximation.
+
+    Memory is O(V × K) for the histograms, independent of N (number of events).
 
     Args
     ----
-    sim_target, gen_target : (N_matched, 9583) int32.
+    acc : Accumulator from _init_accumulators() after the batch loop.
     """
-    n_vox = sim_target.shape[1]
-    sf = sim_target.astype(np.float64)
-    gf = gen_target.astype(np.float64)
+    hist_s = acc["hist_sim"].astype(np.float64)     # (V, K+1)
+    hist_g = acc["hist_gen"].astype(np.float64)
 
-    mean_sim  = sf.mean(axis=0)
-    mean_gen  = gf.mean(axis=0)
-    rate_sim  = (sim_target > 0).mean(axis=0).astype(np.float64)
-    rate_gen  = (gen_target > 0).mean(axis=0).astype(np.float64)
+    n_s = hist_s.sum(axis=1)                        # total event count per voxel
+    n_g = hist_g.sum(axis=1)
+
+    # Normalize to probability mass functions
+    n_s_safe = np.where(n_s > 0, n_s, 1.0)[:, np.newaxis]
+    n_g_safe = np.where(n_g > 0, n_g, 1.0)[:, np.newaxis]
+    p_s = hist_s / n_s_safe                         # (V, K+1)
+    p_g = hist_g / n_g_safe
+
+    # CDFs: F[v, k] = P(hits ≤ k | voxel v)
+    F_s = np.cumsum(p_s, axis=1)                    # (V, K+1)
+    F_g = np.cumsum(p_g, axis=1)
+
+    # W₁ = Σ_{k=0}^{K-1} |F_s − F_g|; last column is identically 1 for both
+    w1 = np.abs(F_s - F_g)[:, :-1].sum(axis=1)     # (V,)
+    # Voxels with zero hits in both are trivially identical
+    w1 = np.where((n_s == 0) & (n_g == 0), 0.0, w1)
+
+    # Per-voxel mean hits and hit rates from histograms
+    k_vals   = np.arange(p_s.shape[1], dtype=np.float64)
+    mean_sim = (p_s * k_vals).sum(axis=1)
+    mean_gen = (p_g * k_vals).sum(axis=1)
+    rate_sim = 1.0 - p_s[:, 0]
+    rate_gen = 1.0 - p_g[:, 0]
     with np.errstate(invalid="ignore", divide="ignore"):
         ratio = np.where(mean_sim > 0, mean_gen / mean_sim, np.nan)
 
-    w1 = np.zeros(n_vox, dtype=np.float64)
-    for i in range(n_vox):
-        if i % 2000 == 0 and i > 0:
-            print(f"    per-voxel W₁: {i}/{n_vox} voxels...")
-        s_col = sf[:, i]
-        g_col = gf[:, i]
-        if s_col.sum() == 0 and g_col.sum() == 0:
-            w1[i] = 0.0
-        else:
-            w1[i] = wasserstein_distance(s_col, g_col)
-
     return {
-        # Private arrays for plotting (stripped before JSON serialization)
         "_mean_hits_sim":    mean_sim,
         "_mean_hits_gen":    mean_gen,
         "_hit_rate_sim":     rate_sim,
         "_hit_rate_gen":     rate_gen,
         "_ratio_gen_to_sim": ratio,
         "_w1_per_voxel":     w1,
-        # Scalar summaries
         "w1_mean":           float(w1.mean()),
         "w1_median":         float(np.median(w1)),
         "w1_max":            float(w1.max()),
@@ -405,66 +648,50 @@ def wasserstein_per_voxel(
 # =============================================================================
 
 def wasserstein_spatial(
-    sim_target: np.ndarray,
-    gen_target: np.ndarray,
+    acc:           dict,
     voxel_centers: np.ndarray,
 ) -> dict:
     """
     Wasserstein distances on 1-D spatial projections of the hit pattern.
 
     Three levels of analysis:
-    (A) Population-level r/z marginals: total hits per voxel across all events,
-        used as weights in wasserstein_distance(coords, coords, u_weights, v_weights).
-    (B) Per-event hit-weighted center-of-gravity (r, z):
-        r_cog[e] = Σ_i hits[e,i] * r[i] / Σ_i hits[e,i].
-    (C) Per-event projection W₁: W₁(z-distribution sim[e], z-distribution gen[e]),
-        skipping events where either side has zero total hits.
-
-    Units: mm.
+    (A) Population-level r/z marginals: total hits per voxel across all events
+        (from acc["tot_sim"] / acc["tot_gen"]).
+    (B) Per-event hit-weighted center-of-gravity (r, z), accumulated per batch.
+    (C) Per-event projection W₁, accumulated per batch.
 
     Args
     ----
-    sim_target, gen_target : (N_matched, 9583) int32.
-    voxel_centers          : (9583, 3) float32 — [x, y, z] in mm.
+    acc           : Accumulator from _init_accumulators() after the batch loop.
+    voxel_centers : (9583, 3) float32 — [x, y, z] in mm.
     """
-    x, y, z = voxel_centers[:, 0].astype(np.float64), \
-               voxel_centers[:, 1].astype(np.float64), \
-               voxel_centers[:, 2].astype(np.float64)
+    x, y, z = (voxel_centers[:, k].astype(np.float64) for k in range(3))
     r = np.sqrt(x**2 + y**2)
 
-    sf = sim_target.astype(np.float64)
-    gf = gen_target.astype(np.float64)
+    tot_sim = acc["tot_sim"]
+    tot_gen = acc["tot_gen"]
 
     # (A) Population marginals
-    tot_sim = sf.sum(axis=0)
-    tot_gen = gf.sum(axis=0)
     w1_r_pop = float(wasserstein_distance(r, r, u_weights=tot_sim, v_weights=tot_gen))
     w1_z_pop = float(wasserstein_distance(z, z, u_weights=tot_sim, v_weights=tot_gen))
 
-    # (B) Per-event center-of-gravity
-    ev_tot_sim = sf.sum(axis=1)
-    ev_tot_gen = gf.sum(axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        cog_r_sim = np.where(ev_tot_sim > 0, sf @ r / ev_tot_sim, np.nan)
-        cog_r_gen = np.where(ev_tot_gen > 0, gf @ r / ev_tot_gen, np.nan)
-        cog_z_sim = np.where(ev_tot_sim > 0, sf @ z / ev_tot_sim, np.nan)
-        cog_z_gen = np.where(ev_tot_gen > 0, gf @ z / ev_tot_gen, np.nan)
-
-    valid_r = ~(np.isnan(cog_r_sim) | np.isnan(cog_r_gen))
-    valid_z = ~(np.isnan(cog_z_sim) | np.isnan(cog_z_gen))
-    w1_cog_r = float(wasserstein_distance(cog_r_sim[valid_r], cog_r_gen[valid_r]))
-    w1_cog_z = float(wasserstein_distance(cog_z_sim[valid_z], cog_z_gen[valid_z]))
+    # (B) Per-event CoG
+    cog_r_sim = acc["cog_r_sim"]
+    cog_r_gen = acc["cog_r_gen"]
+    cog_z_sim = acc["cog_z_sim"]
+    cog_z_gen = acc["cog_z_gen"]
+    valid_r   = ~(np.isnan(cog_r_sim) | np.isnan(cog_r_gen))
+    valid_z   = ~(np.isnan(cog_z_sim) | np.isnan(cog_z_gen))
+    w1_cog_r  = float(wasserstein_distance(cog_r_sim[valid_r], cog_r_gen[valid_r]))
+    w1_cog_z  = float(wasserstein_distance(cog_z_sim[valid_z], cog_z_gen[valid_z]))
 
     # (C) Per-event projection W₁
-    w1_z_ev, w1_r_ev = [], []
-    for e in range(sf.shape[0]):
-        if ev_tot_sim[e] == 0 or ev_tot_gen[e] == 0:
-            continue
-        w1_z_ev.append(wasserstein_distance(z, z, u_weights=sf[e], v_weights=gf[e]))
-        w1_r_ev.append(wasserstein_distance(r, r, u_weights=sf[e], v_weights=gf[e]))
-
-    arr_z = np.asarray(w1_z_ev)
-    arr_r = np.asarray(w1_r_ev)
+    w1_z_ev  = acc["w1_z_ev"]
+    w1_r_ev  = acc["w1_r_ev"]
+    valid_ev = ~np.isnan(w1_z_ev)
+    arr_z    = w1_z_ev[valid_ev]
+    arr_r    = w1_r_ev[valid_ev]
+    N        = len(w1_z_ev)
 
     return {
         "_r_voxel":    r,
@@ -481,7 +708,7 @@ def wasserstein_spatial(
         "w1_r_per_event_std":   float(arr_r.std())  if len(arr_r) else float("nan"),
         "w1_z_per_event_mean":  float(arr_z.mean()) if len(arr_z) else float("nan"),
         "w1_z_per_event_std":   float(arr_z.std())  if len(arr_z) else float("nan"),
-        "n_skipped_per_event":  int(sf.shape[0] - len(w1_z_ev)),
+        "n_skipped_per_event":  int(N - int(valid_ev.sum())),
     }
 
 
@@ -490,62 +717,22 @@ def wasserstein_spatial(
 # =============================================================================
 
 def support_metrics_per_event(
-    sim_target: np.ndarray,
-    gen_target: np.ndarray,
+    acc:          dict,
     region_masks: Dict[str, np.ndarray],
 ) -> dict:
     """
-    Binary voxel-support overlap metrics per event.
-
-    Motivation
-    ----------
-    With 9,583 voxels and O(10²) hits per event, most voxels are zero in both
-    sim and gen. Continuous distribution metrics (JS, MSE) are dominated by
-    matching zeros. These metrics evaluate whether the model activates the
-    *correct voxels*, independently of hit intensity.
-
-    Definitions
-    -----------
-    S_e = {i : sim[e,i] > 0},  G_e = {i : gen[e,i] > 0}
-
-        IoU_e       = |S ∩ G| / |S ∪ G|
-        Precision_e = |S ∩ G| / |G|         (penalises spurious generated hits)
-        Recall_e    = |S ∩ G| / |S|         (penalises missed true hits)
-        Mismatch_e  = |S Δ G| / max(1, |S|)
-
-    Edge cases (vectorised):
-        Both empty   → IoU=1, Precision=1, Recall=1, Mismatch=0
-        G empty only → Precision=0, Recall=0, IoU=0, Mismatch=1
-        S empty only → Precision=0, Recall=0, IoU=0, Mismatch=|G|
-
-    WeightedMismatch: mismatched voxels weighted by (sim+gen) intensity,
-    prioritising high-energy voxels.
+    Binary voxel-support overlap metrics, finalized from accumulator arrays.
 
     Args
     ----
-    sim_target, gen_target : (N_matched, 9583) int32.
-    region_masks           : dict from build_region_masks().
+    acc          : Accumulator from _init_accumulators() after the batch loop.
+    region_masks : Dict from build_region_masks().
     """
-    S = sim_target > 0
-    G = gen_target > 0
-
-    inter    = (S & G).sum(axis=1).astype(np.float64)
-    union_sz = (S | G).sum(axis=1).astype(np.float64)
-    S_size   = S.sum(axis=1).astype(np.float64)
-    G_size   = G.sum(axis=1).astype(np.float64)
-    sym_diff = (S ^ G).sum(axis=1).astype(np.float64)
-
-    iou       = np.where(union_sz > 0, inter / union_sz, 1.0)
-    precision = np.where(G_size > 0, inter / G_size,
-                         np.where(S_size == 0, 1.0, 0.0))
-    recall    = np.where(S_size > 0, inter / S_size,
-                         np.where(G_size == 0, 1.0, 0.0))
-    mismatch  = sym_diff / np.maximum(1.0, S_size)
-
-    total_int = (sim_target + gen_target).astype(np.float64)
-    w_num     = (total_int * (S ^ G)).sum(axis=1)
-    w_den     = total_int.sum(axis=1)
-    wmismatch = np.where(w_den > 0, w_num / w_den, 0.0)
+    iou       = acc["iou_ev"]
+    precision = acc["prec_ev"]
+    recall    = acc["rec_ev"]
+    mismatch  = acc["mismatch_ev"]
+    wmismatch = acc["wmismatch_ev"]
 
     def _s(arr: np.ndarray) -> dict:
         return {
@@ -556,20 +743,12 @@ def support_metrics_per_event(
         }
 
     per_region: dict = {}
-    for r_name, mask in region_masks.items():
-        S_r = S[:, mask];  G_r = G[:, mask]
-        i_r = (S_r & G_r).sum(axis=1).astype(np.float64)
-        u_r = (S_r | G_r).sum(axis=1).astype(np.float64)
-        s_r = S_r.sum(axis=1).astype(np.float64)
-        g_r = G_r.sum(axis=1).astype(np.float64)
-        iou_r  = np.where(u_r > 0, i_r / u_r, 1.0)
-        prec_r = np.where(g_r > 0, i_r / g_r, np.where(s_r == 0, 1.0, 0.0))
-        rec_r  = np.where(s_r > 0, i_r / s_r, np.where(g_r == 0, 1.0, 0.0))
+    for r_name in region_masks:
         per_region[r_name] = {
-            "iou_mean":       float(iou_r.mean()),
-            "iou_std":        float(iou_r.std()),
-            "precision_mean": float(prec_r.mean()),
-            "recall_mean":    float(rec_r.mean()),
+            "iou_mean":       float(acc["iou_ev_r"][r_name].mean()),
+            "iou_std":        float(acc["iou_ev_r"][r_name].std()),
+            "precision_mean": float(acc["prec_ev_r"][r_name].mean()),
+            "recall_mean":    float(acc["rec_ev_r"][r_name].mean()),
         }
 
     return {
@@ -589,32 +768,24 @@ def support_metrics_per_event(
 # Metric 5 — MSE / RMSE
 # =============================================================================
 
-def mse_per_event(
-    sim_target: np.ndarray,
-    gen_target: np.ndarray,
-) -> dict:
+def mse_per_event(acc: dict, n_matched: int) -> dict:
     """
-    L2 / Mean Squared Error on raw voxel hit counts per event.
+    L2 / Mean Squared Error on raw voxel hit counts, finalized from accumulator.
 
-    Captures absolute intensity differences — sensitive to scale errors that
-    JS divergence (which normalises) cannot detect.
-
-        MSE_e  = (1/9583) Σ_i (sim[e,i] − gen[e,i])²
-        RMSE_e = sqrt(MSE_e)
-
-    Population MSE compares the mean hit profiles:
-        pop_MSE = (1/9583) Σ_i (mean_sim[i] − mean_gen[i])²
+    Population MSE is derived from the accumulated per-voxel hit totals:
+        pop_MSE = (1/V) Σ_i (tot_sim[i]/N − tot_gen[i]/N)²
 
     Args
     ----
-    sim_target, gen_target : (N_matched, 9583) int32.
+    acc       : Accumulator from _init_accumulators() after the batch loop.
+    n_matched : Number of matched events (= N).
     """
-    diff = sim_target.astype(np.float64) - gen_target.astype(np.float64)
-    mse  = (diff**2).mean(axis=1)
+    mse  = acc["mse_ev"]
     rmse = np.sqrt(mse)
 
-    pop_mse = float(((sim_target.astype(np.float64).mean(axis=0)
-                    - gen_target.astype(np.float64).mean(axis=0))**2).mean())
+    mean_s   = acc["tot_sim"] / n_matched
+    mean_g   = acc["tot_gen"] / n_matched
+    pop_mse  = float(((mean_s - mean_g) ** 2).mean())
 
     return {
         "_mse_per_event":  mse,
@@ -635,50 +806,27 @@ def mse_per_event(
 # =============================================================================
 
 def poisson_nll_per_event(
-    sim_target: np.ndarray,
-    gen_target: np.ndarray,
+    acc:          dict,
+    n_matched:    int,
     region_masks: Dict[str, np.ndarray],
 ) -> dict:
     """
-    Poisson NLL treating gen[e,i] as the Poisson rate λ and sim[e,i] as the
-    observed count k, with the constant log(k!) term omitted.
-
-    Physical motivation
-    -------------------
-    Voxel hit counts are photon detection counts — discrete, non-negative,
-    and naturally modelled as Poisson random variables. The Poisson NLL is
-    the canonical goodness-of-fit metric for count data.
-
-    Formula
-    -------
-        PoissonNLL_e = Σ_i [ gen[e,i] − sim[e,i] · log(gen[e,i] + ε) ]
-
-    ε = 1e-6 is added inside the logarithm *only* as a numerical guard to
-    prevent log(0). This is distinct from Laplace distribution smoothing:
-    it does not alter any probability distribution. Voxels where gen[e,i]=0
-    receive a large finite penalty (~sim[e,i]·13.8) rather than +∞, correctly
-    penalising the model for predicting zero where the simulation observed hits.
+    Poisson NLL treating gen[e,i] as rate λ and sim[e,i] as observed count k,
+    finalized from accumulator arrays.
 
     Args
     ----
-    sim_target, gen_target : (N_matched, 9583) int32.
-    region_masks           : dict from build_region_masks().
+    acc          : Accumulator from _init_accumulators() after the batch loop.
+    n_matched    : Number of matched events.
+    region_masks : Dict from build_region_masks().
     """
-    eps = 1e-6
-    gf  = gen_target.astype(np.float64)
-    sf  = sim_target.astype(np.float64)
+    nll_ev   = acc["nll_ev"]
+    mean_pen = float(acc["penalised_sum"]) / n_matched
 
-    log_gen  = np.log(gf + eps)                  # (N, 9583)
-    nll_mat  = gf - sf * log_gen                  # (N, 9583)
-    nll_ev   = nll_mat.sum(axis=1)                # (N,)
-
-    # Fraction of voxels penalised by zero gen (gen=0, sim>0)
-    penalised = ((gen_target == 0) & (sim_target > 0))
-    mean_pen  = float(penalised.sum(axis=1).mean())
-
-    def _region_nll(mask: np.ndarray) -> dict:
-        nll_r = nll_mat[:, mask].sum(axis=1)
-        return {
+    per_region: dict = {}
+    for r_name in region_masks:
+        nll_r = acc["nll_ev_r"][r_name]
+        per_region[r_name] = {
             "mean":   float(nll_r.mean()),
             "std":    float(nll_r.std()),
             "median": float(np.median(nll_r)),
@@ -691,7 +839,7 @@ def poisson_nll_per_event(
         "median":                            float(np.median(nll_ev)),
         "p95":                               float(np.percentile(nll_ev, 95)),
         "mean_penalised_voxels_per_event":   mean_pen,
-        "per_region": {r: _region_nll(m) for r, m in region_masks.items()},
+        "per_region": per_region,
     }
 
 
@@ -699,47 +847,26 @@ def poisson_nll_per_event(
 # Metric 7 — Jensen-Shannon Divergence
 # =============================================================================
 
-def js_divergence_population(
-    sim_target: np.ndarray,
-    gen_target: np.ndarray,
-) -> dict:
+def js_divergence_population(acc: dict) -> dict:
     """
-    Population-level Jensen-Shannon divergence on the voxel hit distribution.
-
-    Normalise total hits over all events per voxel to a probability mass function:
-        p_sim[i] = total_hits_sim[i] / Σ_j total_hits_sim[j]
-
-    Jensen-Shannon divergence:
-        M = (P_sim + P_gen) / 2
-        JS(P_sim, P_gen) = ½ KL(P_sim ∥ M) + ½ KL(P_gen ∥ M)
-
-    JS is symmetric, bounded in [0, ln 2] ≈ 0.693 nats, and *always finite
-    without ε-smoothing*: M_i = 0 only when both p_sim[i] = 0 and p_gen[i] = 0,
-    in which case rel_entr(0, 0) = 0 by the convention used in scipy.
-
-    Raw KL(P_sim ∥ P_gen) is also computed and flagged as infinite if the
-    generated model fails to cover any voxel populated in sim.
-
-    References
-    ----------
-    Kullback & Leibler (1951); Lin (1991).
+    Population-level JS divergence from accumulated per-voxel hit totals.
 
     Args
     ----
-    sim_target, gen_target : (N_matched, 9583) int32.
+    acc : Accumulator from _init_accumulators() after the batch loop.
     """
-    tot_sim = sim_target.astype(np.float64).sum(axis=0)
-    tot_gen = gen_target.astype(np.float64).sum(axis=0)
-    p_sim = tot_sim / tot_sim.sum()
-    p_gen = tot_gen / tot_gen.sum()
-    M     = 0.5 * (p_sim + p_gen)
+    tot_sim = acc["tot_sim"]
+    tot_gen = acc["tot_gen"]
+    p_sim   = tot_sim / tot_sim.sum()
+    p_gen   = tot_gen / tot_gen.sum()
+    M       = 0.5 * (p_sim + p_gen)
 
     js_val = float(0.5 * rel_entr(p_sim, M).sum() + 0.5 * rel_entr(p_gen, M).sum())
 
-    kl_sg  = rel_entr(p_sim, p_gen)
-    kl_gs  = rel_entr(p_gen, p_sim)
-    kl_sg_finite = bool(np.all(np.isfinite(kl_sg)))
-    kl_gs_finite = bool(np.all(np.isfinite(kl_gs)))
+    kl_sg          = rel_entr(p_sim, p_gen)
+    kl_gs          = rel_entr(p_gen, p_sim)
+    kl_sg_finite   = bool(np.all(np.isfinite(kl_sg)))
+    kl_gs_finite   = bool(np.all(np.isfinite(kl_gs)))
 
     return {
         "_p_sim": p_sim,
@@ -755,65 +882,22 @@ def js_divergence_population(
 
 
 def js_divergence_per_event(
-    sim_target: np.ndarray,
-    gen_target: np.ndarray,
+    acc:          dict,
     region_masks: Dict[str, np.ndarray],
-    chunk_size: int = 1000,
 ) -> dict:
     """
-    Per-event Jensen-Shannon divergence on normalised voxel hit distributions.
-
-    Per-event raw KL divergence is +∞ for virtually every event: a single-event
-    hit pattern is too sparse for the model to reproduce exactly. JS divergence
-    is used instead — always finite, symmetric, without ε-smoothing.
-
-    For event e:
-        sim_norm[e,i] = sim[e,i] / Σ_j sim[e,j]   (0 for all-zero events)
-        gen_norm[e,i] = gen[e,i] / Σ_j gen[e,j]
-        M[e]          = (sim_norm[e] + gen_norm[e]) / 2
-        JS_e = ½ rel_entr(sim_norm[e], M[e]).sum()
-             + ½ rel_entr(gen_norm[e], M[e]).sum()
-
-    Zero-hit events (both sim and gen = 0): the denominator is clipped to 1,
-    giving norm[e] = 0 everywhere, M[e] = 0, and JS_e = 0 (no divergence between
-    two identical all-zero vectors).
-
-    Processed in chunks to limit memory (~40 MB per chunk at N=1000).
+    Per-event JS divergence, finalized from accumulator arrays.
 
     Args
     ----
-    sim_target, gen_target : (N_matched, 9583) int32.
-    region_masks           : dict from build_region_masks().
-    chunk_size             : Events per processing chunk (default 1000).
+    acc          : Accumulator from _init_accumulators() after the batch loop.
+    region_masks : Dict from build_region_masks().
     """
-    N = sim_target.shape[0]
-    js_ev = np.zeros(N, dtype=np.float64)
-    region_js = {r: np.zeros(N, dtype=np.float64) for r in region_masks}
+    js_ev = acc["js_ev"]
 
-    for start in range(0, N, chunk_size):
-        end   = min(start + chunk_size, N)
-        sc    = sim_target[start:end].astype(np.float64)
-        gc    = gen_target[start:end].astype(np.float64)
-        s_sum = sc.sum(axis=1, keepdims=True).clip(min=1)
-        g_sum = gc.sum(axis=1, keepdims=True).clip(min=1)
-        sn    = sc / s_sum;  gn = gc / g_sum
-        Mn    = 0.5 * (sn + gn)
-        js_ev[start:end] = (
-            0.5 * rel_entr(sn, Mn).sum(axis=1)
-          + 0.5 * rel_entr(gn, Mn).sum(axis=1)
-        )
-        for r_name, mask in region_masks.items():
-            sr = sc[:, mask];  gr = gc[:, mask]
-            sr_n = sr / sr.sum(axis=1, keepdims=True).clip(min=1)
-            gr_n = gr / gr.sum(axis=1, keepdims=True).clip(min=1)
-            Mr   = 0.5 * (sr_n + gr_n)
-            region_js[r_name][start:end] = (
-                0.5 * rel_entr(sr_n, Mr).sum(axis=1)
-              + 0.5 * rel_entr(gr_n, Mr).sum(axis=1)
-            )
-
-    per_region = {}
-    for r_name, arr in region_js.items():
+    per_region: dict = {}
+    for r_name in region_masks:
+        arr = acc["js_ev_r"][r_name]
         per_region[r_name] = {
             "mean":   float(arr.mean()),
             "std":    float(arr.std()),
@@ -835,33 +919,33 @@ def js_divergence_per_event(
 # =============================================================================
 
 def _spatial_profiles(
-    sim_target: np.ndarray,
-    gen_target: np.ndarray,
+    acc:           dict,
     voxel_centers: np.ndarray,
-    n_bins_r: int = 50,
-    n_bins_z: int = 80,
+    n_bins_r:      int = 50,
+    n_bins_z:      int = 80,
 ) -> dict:
     """
     Hit-count-weighted radial and z-axis probability density histograms.
+    Uses the population hit totals from acc (same arrays as M3/M7-pop).
 
-    Each bin weight = total hits in voxels within that coordinate range,
-    summed across all events, normalised to unit area.
-
-    Returns bin centres and density arrays for plotting.
+    Args
+    ----
+    acc           : Accumulator from _init_accumulators() after the batch loop.
+    voxel_centers : (9583, 3) float32 — [x, y, z] in mm.
     """
     x, y, z = (voxel_centers[:, k].astype(np.float64) for k in range(3))
     r = np.sqrt(x**2 + y**2)
 
-    w_sim = sim_target.astype(np.float64).sum(axis=0)
-    w_gen = gen_target.astype(np.float64).sum(axis=0)
+    w_sim = acc["tot_sim"]
+    w_gen = acc["tot_gen"]
 
     def _hist1d(coord, n_bins):
         bins = np.linspace(coord.min(), coord.max(), n_bins + 1)
         hs, _ = np.histogram(coord, bins=bins, weights=w_sim)
         hg, _ = np.histogram(coord, bins=bins, weights=w_gen)
-        bw = bins[1] - bins[0]
-        hs = hs / (hs.sum() * bw + 1e-30)
-        hg = hg / (hg.sum() * bw + 1e-30)
+        bw    = bins[1] - bins[0]
+        hs    = hs / (hs.sum() * bw + 1e-30)
+        hg    = hg / (hg.sum() * bw + 1e-30)
         return 0.5 * (bins[:-1] + bins[1:]), hs, hg
 
     r_ctrs, r_sim_h, r_gen_h = _hist1d(r, n_bins_r)
@@ -899,8 +983,8 @@ def plot_all(metrics: dict, output_dir: str) -> None:
 
 
 def _plot_region_hits(metrics: dict, pd: Path) -> None:
-    sim_region = metrics["_sim_region"]
-    gen_region = metrics["_gen_region"]
+    sim_region  = metrics["_sim_region"]
+    gen_region  = metrics["_gen_region"]
     region_data = metrics["region_hits"]
 
     fig, axes = plt.subplots(2, 3, figsize=(14, 8))
@@ -909,8 +993,8 @@ def _plot_region_hits(metrics: dict, pd: Path) -> None:
 
     for ax_idx, (r_name, r_idx) in enumerate(panels):
         ax = axes[ax_idx]
-        s = sim_region[:, r_idx]
-        g = gen_region[:, r_idx]
+        s  = sim_region[:, r_idx]
+        g  = gen_region[:, r_idx]
         hi = max(int(max(s.max(), g.max())) + 1, 2)
         bins = np.arange(0, hi + 1)
         ax.hist(s, bins=bins, density=True, alpha=0.6, label="sim", color="steelblue")
@@ -922,8 +1006,8 @@ def _plot_region_hits(metrics: dict, pd: Path) -> None:
     ax = axes[4]
     s_tot = sim_region.sum(axis=1)
     g_tot = gen_region.sum(axis=1)
-    hi = max(int(max(s_tot.max(), g_tot.max())) + 1, 2)
-    bins = np.linspace(0, hi, 60)
+    hi    = max(int(max(s_tot.max(), g_tot.max())) + 1, 2)
+    bins  = np.linspace(0, hi, 60)
     ax.hist(s_tot, bins=bins, density=True, alpha=0.6, label="sim", color="steelblue")
     ax.hist(g_tot, bins=bins, density=True, alpha=0.6, label="gen", color="darkorange")
     rd = region_data["TOTAL_HITS"]
@@ -938,7 +1022,7 @@ def _plot_region_hits(metrics: dict, pd: Path) -> None:
 
 
 def _plot_voxel_mean_hits(metrics: dict, pd: Path) -> None:
-    vm = metrics["_per_voxel"]
+    vm  = metrics["_per_voxel"]
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     idx = np.arange(len(vm["_mean_hits_sim"]))
@@ -954,8 +1038,8 @@ def _plot_voxel_mean_hits(metrics: dict, pd: Path) -> None:
 
     ratio = vm["_ratio_gen_to_sim"]
     valid = np.isfinite(ratio)
-    sc = axes[2].scatter(idx[valid], ratio[valid], s=0.3, alpha=0.5,
-                          c=ratio[valid], cmap="RdBu_r", vmin=0.5, vmax=2.0)
+    sc    = axes[2].scatter(idx[valid], ratio[valid], s=0.3, alpha=0.5,
+                            c=ratio[valid], cmap="RdBu_r", vmin=0.5, vmax=2.0)
     plt.colorbar(sc, ax=axes[2], label="gen/sim")
     axes[2].axhline(1.0, color="gray", lw=0.8, ls="--")
     axes[2].set_title("gen/sim hit ratio per voxel")
@@ -1115,7 +1199,7 @@ def _plot_wasserstein_summary(metrics: dict, pd: Path) -> None:
         metrics["spatial"]["w1_cog_z"],
         metrics["per_voxel"]["w1_mean"],
     ]
-    units = ["hits"]*5 + ["mm"]*4 + ["hits"]
+    units = ["hits"] * 5 + ["mm"] * 4 + ["hits"]
 
     fig, ax = plt.subplots(figsize=(9, 5))
     bars = ax.barh(labels[::-1], values[::-1], color="steelblue", alpha=0.75,
@@ -1177,6 +1261,9 @@ def main() -> None:
                         help="Max matched events to analyse (default: all).")
     parser.add_argument("--seed",       type=int, default=42, help="Random seed.")
     parser.add_argument("--no_plots",   action="store_true",  help="Skip plot generation.")
+    parser.add_argument("--chunk_size", type=int, default=10_000,
+                        help="Events per batch in the streaming pipeline (default: 10000). "
+                             "Reduce if RAM is tight; increase if I/O is the bottleneck.")
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -1184,21 +1271,26 @@ def main() -> None:
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
-    # 1. Load ─────────────────────────────────────────────────────────────────
-    print("\n[1/9] Loading HDF5 files...")
-    # Sim: load everything except target_matrix (can be tens of GB for large files).
-    # target_matrix rows are loaded lazily after event pairing (step 3).
+    # 1. Load metadata ─────────────────────────────────────────────────────────
+    # Neither file's target_matrix is loaded here — they are streamed in the
+    # batch loop (step 5).  Only event_ids / region_matrix / phi_matrix are
+    # needed upfront.
+    print("\n[1/9] Loading HDF5 metadata...")
     sim = load_hdf5(args.sim, load_target=False)
-    gen = load_hdf5(args.gen, load_target=True)
-    print(f"  Sim: {sim['n_events']:,} events (target_matrix deferred) | "
-          f"Gen: {gen['n_events']:,} events")
+    gen = load_hdf5(args.gen, load_target=False)
+    print(f"  Sim: {sim['n_events']:,} events | Gen: {gen['n_events']:,} events")
+    print(f"  target_matrix deferred — will be streamed in chunks of {args.chunk_size:,}")
 
-    # 2. Geometry ─────────────────────────────────────────────────────────────
+    # 2. Geometry ──────────────────────────────────────────────────────────────
     print("\n[2/9] Building voxel geometry and region masks...")
     voxel_centers = build_voxel_centers(args.gen, gen["target_columns"])
     region_masks  = build_region_masks(gen["target_columns"])
+    x_vc = voxel_centers[:, 0].astype(np.float64)
+    y_vc = voxel_centers[:, 1].astype(np.float64)
+    z_vc = voxel_centers[:, 2].astype(np.float64)
+    r_vc = np.sqrt(x_vc**2 + y_vc**2)
 
-    # 3. Pair events ──────────────────────────────────────────────────────────
+    # 3. Pair and subsample events ─────────────────────────────────────────────
     print("\n[3/9] Pairing events...")
     sim_idx, gen_idx = pair_events(sim, gen)
 
@@ -1210,64 +1302,90 @@ def main() -> None:
         print(f"  Subsampled to {len(sim_idx):,} events (--n_events {args.n_events}).")
     n_matched = len(sim_idx)
 
-    # Load only the matched sim rows — avoids loading the full (N_sim, 9583) matrix.
-    print(f"  Loading {n_matched:,} matched sim rows from target_matrix...")
-    t_load = time.time()
-    sim_target = load_target_rows(args.sim, sim_idx)          # (N, 9583) int32
-    gen_target = gen["target_matrix"][gen_idx]                 # (N, 9583) int32
-    print(f"  target_matrix loaded: {time.time()-t_load:.1f}s  "
-          f"({sim_target.nbytes/1e6:.0f} MB sim + {gen_target.nbytes/1e6:.0f} MB gen)")
-    sim_region = sim["region_matrix"][sim_idx]                 # (N, 4) int32
+    # Region matrices are (N, 4) — trivially small even at large N; load now.
+    sim_region = sim["region_matrix"][sim_idx]
     gen_region = gen["region_matrix"][gen_idx]
 
-    # 4. Wasserstein ──────────────────────────────────────────────────────────
-    print("\n[4/9] Wasserstein distances...")
+    # 4. First pass: find kmax ─────────────────────────────────────────────────
+    print(f"\n[4/9] First pass — finding global max hit count "
+          f"({n_matched:,} events, chunk={args.chunk_size:,})...")
     t = time.time()
-    reg_m = wasserstein_region(sim_region, gen_region)
+    kmax = _find_kmax(args.sim, args.gen, sim_idx, gen_idx, args.chunk_size)
+    print(f"  kmax = {kmax}  ({time.time()-t:.1f}s)")
+    hist_mem_mb = 2 * 9583 * (kmax + 1) * 8 / 1e6
+    print(f"  Histogram memory: {hist_mem_mb:.1f} MB (2 × 9583 × {kmax+1} int64)")
+
+    # 5. Batch accumulation loop ───────────────────────────────────────────────
+    # Single pass over all N matched events in chunks of chunk_size.
+    # All 7 metrics are accumulated simultaneously; no dense (N, 9583) matrix
+    # is ever held in RAM — only the current chunk (chunk_size × 9583).
+    print(f"\n[5/9] Batch accumulation — all metrics "
+          f"({n_matched:,} events in {-(-n_matched // args.chunk_size)} batches)...")
+    acc = _init_accumulators(n_matched, kmax, region_masks)
+
+    # Pre-sort global indices for efficient sequential HDF5 reads.
+    # Within each batch we sort locally to restore the pairing order.
+    t = time.time()
+    n_batches = -(-n_matched // args.chunk_size)   # ceil division
+
+    with h5py.File(args.sim, "r") as f_sim, h5py.File(args.gen, "r") as f_gen:
+        ds_sim = f_sim["target_matrix"]
+        ds_gen = f_gen["target_matrix"]
+
+        for batch_num, batch_start in enumerate(range(0, n_matched, args.chunk_size)):
+            batch_end = min(batch_start + args.chunk_size, n_matched)
+
+            # Sort this batch's indices for efficient I/O, then un-sort to
+            # restore the sim↔gen pairing (sc[i] corresponds to gc[i]).
+            b_sim = sim_idx[batch_start:batch_end]
+            b_gen = gen_idx[batch_start:batch_end]
+            sort_s = np.argsort(b_sim);  inv_s = np.argsort(sort_s)
+            sort_g = np.argsort(b_gen);  inv_g = np.argsort(sort_g)
+
+            sc = ds_sim[b_sim[sort_s]][inv_s].astype(np.int32)
+            gc = ds_gen[b_gen[sort_g]][inv_g].astype(np.int32)
+
+            _process_batch(acc, sc, gc, batch_start, r_vc, z_vc, region_masks)
+
+            if (batch_num + 1) % max(1, n_batches // 10) == 0 or batch_num == 0:
+                elapsed = time.time() - t
+                done    = batch_end / n_matched
+                eta     = elapsed / done * (1 - done) if done > 0 else 0
+                print(f"  Batch {batch_num+1:>4}/{n_batches}  "
+                      f"{batch_end:>{len(str(n_matched))},}/{n_matched:,}  "
+                      f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s")
+
+    print(f"  Batch loop done: {time.time()-t:.1f}s")
+
+    # 6–8. Finalize metrics from accumulators ──────────────────────────────────
+    print("\n[6/9] Wasserstein distances (finalize from accumulators)...")
+    t = time.time()
+    reg_m  = wasserstein_region(sim_region, gen_region)
     print(f"  Region W₁: done ({time.time()-t:.1f}s)")
 
     t = time.time()
-    print("  Per-voxel W₁ (9583 voxels, may take ~30 s)...")
-    vox_m = wasserstein_per_voxel(sim_target, gen_target)
+    vox_m  = wasserstein_per_voxel(acc)
     print(f"  Per-voxel W₁: done ({time.time()-t:.1f}s)  mean={vox_m['w1_mean']:.3f}")
 
     t = time.time()
-    spat_m  = wasserstein_spatial(sim_target, gen_target, voxel_centers)
-    spat_pr = _spatial_profiles(sim_target, gen_target, voxel_centers)
+    spat_m  = wasserstein_spatial(acc, voxel_centers)
+    spat_pr = _spatial_profiles(acc, voxel_centers)
     print(f"  Spatial W₁ + profiles: done ({time.time()-t:.1f}s)")
 
-    # 5. Support metrics ───────────────────────────────────────────────────────
-    print("\n[5/9] Support metrics (IoU, precision, recall)...")
+    print("\n[7/9] Support / MSE / NLL / JS (finalize from accumulators)...")
     t = time.time()
-    supp_m = support_metrics_per_event(sim_target, gen_target, region_masks)
+    supp_m = support_metrics_per_event(acc, region_masks)
+    mse_m  = mse_per_event(acc, n_matched)
+    nll_m  = poisson_nll_per_event(acc, n_matched, region_masks)
+    js_pop = js_divergence_population(acc)
+    js_ev  = js_divergence_per_event(acc, region_masks)
     print(f"  done ({time.time()-t:.1f}s) | "
           f"IoU={supp_m['iou']['mean']:.3f}  "
-          f"P={supp_m['precision']['mean']:.3f}  "
-          f"R={supp_m['recall']['mean']:.3f}")
+          f"RMSE={mse_m['rmse_mean']:.3f}  "
+          f"JS(pop)={js_pop['js_divergence']:.5f}")
 
-    # 6. MSE ───────────────────────────────────────────────────────────────────
-    print("\n[6/9] MSE / RMSE...")
-    t = time.time()
-    mse_m = mse_per_event(sim_target, gen_target)
-    print(f"  done ({time.time()-t:.1f}s) | mean RMSE={mse_m['rmse_mean']:.3f}")
-
-    # 7. Poisson NLL ───────────────────────────────────────────────────────────
-    print("\n[7/9] Poisson NLL...")
-    t = time.time()
-    nll_m = poisson_nll_per_event(sim_target, gen_target, region_masks)
-    print(f"  done ({time.time()-t:.1f}s) | mean NLL={nll_m['mean']:.1f}")
-
-    # 8. JS divergence ─────────────────────────────────────────────────────────
-    print("\n[8/9] Jensen-Shannon divergence...")
-    t = time.time()
-    js_pop = js_divergence_population(sim_target, gen_target)
-    js_ev  = js_divergence_per_event(sim_target, gen_target, region_masks)
-    print(f"  done ({time.time()-t:.1f}s) | "
-          f"JS(pop)={js_pop['js_divergence']:.5f}  "
-          f"JS(event mean)={js_ev['mean']:.5f}")
-
-    # 9. Save ──────────────────────────────────────────────────────────────────
-    print("\n[9/9] Saving results...")
+    # 8. Save ──────────────────────────────────────────────────────────────────
+    print("\n[8/9] Saving results...")
     metrics = {
         "metadata": {
             "sim_file":         args.sim,
@@ -1276,6 +1394,8 @@ def main() -> None:
             "n_gen_events":     gen["n_events"],
             "n_matched_events": int(n_matched),
             "n_unmatched_gen":  gen["n_events"] - n_matched,
+            "chunk_size":       args.chunk_size,
+            "kmax":             kmax,
             "seed":             args.seed,
             "timestamp":        datetime.datetime.now().isoformat(timespec="seconds"),
             "runtime_s":        round(time.time() - t0, 1),
@@ -1290,25 +1410,35 @@ def main() -> None:
         "js_population":  {k: v for k, v in js_pop.items() if not k.startswith("_")},
         "js_per_event":   {k: v for k, v in js_ev.items()  if not k.startswith("_")},
         # Private arrays for plotting (stripped from JSON by save_metrics_json)
-        "_per_voxel":              vox_m,
-        "_spatial_profiles":       spat_pr,
-        "_js_per_event_arr":       js_ev["_js_per_event"],
-        "_rmse_per_event_arr":     mse_m["_rmse_per_event"],
-        "_nll_per_event_arr":      nll_m["_nll_per_event"],
-        "_iou_per_event_arr":      supp_m["_iou_per_event"],
-        "_precision_per_event_arr":supp_m["_precision_per_event"],
-        "_recall_per_event_arr":   supp_m["_recall_per_event"],
-        "_sim_region":             sim_region,
-        "_gen_region":             gen_region,
+        "_per_voxel":               vox_m,
+        "_spatial_profiles":        spat_pr,
+        "_js_per_event_arr":        js_ev["_js_per_event"],
+        "_rmse_per_event_arr":      mse_m["_rmse_per_event"],
+        "_nll_per_event_arr":       nll_m["_nll_per_event"],
+        "_iou_per_event_arr":       supp_m["_iou_per_event"],
+        "_precision_per_event_arr": supp_m["_precision_per_event"],
+        "_recall_per_event_arr":    supp_m["_recall_per_event"],
+        "_sim_region":              sim_region,
+        "_gen_region":              gen_region,
     }
 
     save_metrics_json(metrics, str(Path(args.output_dir) / "metrics.json"))
 
+    # 9. Plots ─────────────────────────────────────────────────────────────────
     if not args.no_plots:
-        print("  Generating plots...")
+        print("\n[9/9] Generating plots...")
+        t = time.time()
         plot_all(metrics, args.output_dir)
+        print(f"  done ({time.time()-t:.1f}s)")
+    else:
+        print("\n[9/9] Plots skipped (--no_plots).")
 
-    print(f"\n✓ Done in {time.time()-t0:.1f}s  →  {args.output_dir}/")
+    elapsed = time.time() - t0
+    h = int(elapsed // 3600)
+    m = int((elapsed % 3600) // 60)
+    s = elapsed % 60
+    print(f"\nTotal runtime: {h:02d}:{m:02d}:{s:05.2f}")
+    print("Done.")
 
 
 if __name__ == "__main__":
