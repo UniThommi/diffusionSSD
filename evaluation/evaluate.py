@@ -15,7 +15,7 @@ Metrics
 
 Usage
 -----
-    python src/evaluation/evaluate.py \\
+    python evaluation/evaluate.py \\
         --sim  /path/to/MLFormatSSD.hdf5 \\
         --gen  /path/to/generated.hdf5 \\
         [--output_dir results/] [--n_events 5000] [--seed 42] [--no_plots]
@@ -50,25 +50,34 @@ _REGION_COLS = [("PIT", 0), ("BOT", 1), ("WALL", 2), ("TOP", 3)]
 # I/O and Geometry
 # =============================================================================
 
-def load_hdf5(path: str) -> dict:
+def load_hdf5(path: str, load_target: bool = True) -> dict:
     """
-    Load phi_matrix, target_matrix, region_matrix, target_columns, and
-    (when present) event_ids / event_id_columns from an ML-format HDF5 file.
+    Load an ML-format HDF5 file.
+
+    Parameters
+    ----------
+    path         : Path to the HDF5 file.
+    load_target  : If True (default), load the full target_matrix into RAM.
+                   Set to False for large simulation files where only event_ids,
+                   region_matrix, and phi_matrix are needed upfront (e.g. to
+                   pair events before loading only the matched rows via
+                   load_target_rows()).
 
     Returns
     -------
     dict with:
         phi_matrix       : (N, 30)   float32 — conditioning features
-        target_matrix    : (N, 9583) int32   — voxel hit counts (denormalized)
+        target_matrix    : (N, 9583) int32   — voxel hit counts, or None if
+                           load_target=False
         region_matrix    : (N, 4)    int32   — [pit, bot, wall, top] hits
         target_columns   : list[str], length 9583 — voxel index strings
         event_ids        : (N, k)    int64   — [run_id, (muon_id,) nc_id], or
                            None if the file predates ID writing.
         event_id_columns : list[str] of length k, or None.
+        n_events         : int — total number of events in the file.
     """
     with h5py.File(path, "r") as f:
         phi_matrix    = f["phi_matrix"][:]
-        target_matrix = f["target_matrix"][:].astype(np.int32)
         region_matrix = f["region_matrix"][:].astype(np.int32)
         target_columns = [
             c.decode() if isinstance(c, bytes) else c
@@ -84,12 +93,19 @@ def load_hdf5(path: str) -> dict:
             event_ids        = None
             event_id_columns = None
 
-    n_vox = target_matrix.shape[1]
-    if n_vox != 9583:
-        raise ValueError(
-            f"Expected 9583 voxels, got {n_vox} in '{path}'. "
-            "Ensure this is an ML-format HDF5 from the NC simulation pipeline."
-        )
+        n_events = int(region_matrix.shape[0])
+
+        if load_target:
+            target_matrix = f["target_matrix"][:].astype(np.int32)
+            n_vox = target_matrix.shape[1]
+            if n_vox != 9583:
+                raise ValueError(
+                    f"Expected 9583 voxels, got {n_vox} in '{path}'. "
+                    "Ensure this is an ML-format HDF5 from the NC simulation pipeline."
+                )
+        else:
+            target_matrix = None
+
     return {
         "phi_matrix":        phi_matrix,
         "target_matrix":     target_matrix,
@@ -97,7 +113,37 @@ def load_hdf5(path: str) -> dict:
         "target_columns":    target_columns,
         "event_ids":         event_ids,
         "event_id_columns":  event_id_columns,
+        "n_events":          n_events,
     }
+
+
+def load_target_rows(path: str, row_indices: np.ndarray) -> np.ndarray:
+    """
+    Load only selected rows from target_matrix in an HDF5 file.
+
+    h5py fancy indexing requires a sorted index array for efficient I/O
+    (a single contiguous read pass rather than one seek per row).  We sort
+    the requested indices, load, then invert the permutation so the returned
+    array aligns with the original (unsorted) row_indices ordering.
+
+    Parameters
+    ----------
+    path        : Path to the HDF5 file.
+    row_indices : 1-D int array of row positions to load (any order, no repeats).
+
+    Returns
+    -------
+    (len(row_indices), 9583) int32 array — rows in the same order as row_indices.
+    """
+    sort_order   = np.argsort(row_indices)
+    sorted_idx   = row_indices[sort_order]
+    inv_order    = np.empty_like(sort_order)
+    inv_order[sort_order] = np.arange(len(sort_order))
+
+    with h5py.File(path, "r") as f:
+        data = f["target_matrix"][sorted_idx].astype(np.int32)
+
+    return data[inv_order]
 
 
 def build_voxel_centers(gen_path: str, target_columns: list) -> np.ndarray:
@@ -1140,10 +1186,12 @@ def main() -> None:
 
     # 1. Load ─────────────────────────────────────────────────────────────────
     print("\n[1/9] Loading HDF5 files...")
-    sim = load_hdf5(args.sim)
-    gen = load_hdf5(args.gen)
-    print(f"  Sim: {sim['target_matrix'].shape[0]:,} events | "
-          f"Gen: {gen['target_matrix'].shape[0]:,} events")
+    # Sim: load everything except target_matrix (can be tens of GB for large files).
+    # target_matrix rows are loaded lazily after event pairing (step 3).
+    sim = load_hdf5(args.sim, load_target=False)
+    gen = load_hdf5(args.gen, load_target=True)
+    print(f"  Sim: {sim['n_events']:,} events (target_matrix deferred) | "
+          f"Gen: {gen['n_events']:,} events")
 
     # 2. Geometry ─────────────────────────────────────────────────────────────
     print("\n[2/9] Building voxel geometry and region masks...")
@@ -1162,9 +1210,14 @@ def main() -> None:
         print(f"  Subsampled to {len(sim_idx):,} events (--n_events {args.n_events}).")
     n_matched = len(sim_idx)
 
-    sim_target = sim["target_matrix"][sim_idx]   # (N, 9583) int32
-    gen_target = gen["target_matrix"][gen_idx]
-    sim_region = sim["region_matrix"][sim_idx]   # (N, 4) int32
+    # Load only the matched sim rows — avoids loading the full (N_sim, 9583) matrix.
+    print(f"  Loading {n_matched:,} matched sim rows from target_matrix...")
+    t_load = time.time()
+    sim_target = load_target_rows(args.sim, sim_idx)          # (N, 9583) int32
+    gen_target = gen["target_matrix"][gen_idx]                 # (N, 9583) int32
+    print(f"  target_matrix loaded: {time.time()-t_load:.1f}s  "
+          f"({sim_target.nbytes/1e6:.0f} MB sim + {gen_target.nbytes/1e6:.0f} MB gen)")
+    sim_region = sim["region_matrix"][sim_idx]                 # (N, 4) int32
     gen_region = gen["region_matrix"][gen_idx]
 
     # 4. Wasserstein ──────────────────────────────────────────────────────────
@@ -1219,10 +1272,10 @@ def main() -> None:
         "metadata": {
             "sim_file":         args.sim,
             "gen_file":         args.gen,
-            "n_sim_events":     int(sim["target_matrix"].shape[0]),
-            "n_gen_events":     int(gen["target_matrix"].shape[0]),
+            "n_sim_events":     sim["n_events"],
+            "n_gen_events":     gen["n_events"],
             "n_matched_events": int(n_matched),
-            "n_unmatched_gen":  int(gen["target_matrix"].shape[0] - n_matched),
+            "n_unmatched_gen":  gen["n_events"] - n_matched,
             "seed":             args.seed,
             "timestamp":        datetime.datetime.now().isoformat(timespec="seconds"),
             "runtime_s":        round(time.time() - t0, 1),
