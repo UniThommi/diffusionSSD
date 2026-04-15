@@ -45,9 +45,10 @@ checkpoint_dir = "./checkpoints"
 # Event limiting (auskommentiert = use all events)
 max_events = 5000000   # max 100000
 
-# Distillation (NICHT IMPLEMENTIERT - nur Struktur)
+# Distillation (set enable_distillation=true to run, then adjust factor and teacher dir)
 enable_distillation = false
-distillation_factor = 1
+distillation_factor = 2
+teacher_checkpoint_dir = "./checkpoints/nc_score_MoreData_GPU"
 
 [model]
 # Embedding dimension

@@ -251,12 +251,29 @@ if __name__ == '__main__':
     with strategy.scope():
         model = scoreDiffusion(num_area=num_area, num_cond=num_cond, config=config)
 
-    # === Distillation (NOT IMPLEMENTED - Structure only) ===
+    # === Distillation ===
     if config['training']['enable_distillation']:
-        raise NotImplementedError(
-            "Distillation not yet implemented for NC-Score.\n"
-            "Set enable_distillation = false in config.toml"
+        from src.training.distill_nc import scoreDiffusion_distill
+
+        # The scoreDiffusion instance created above becomes the teacher.
+        # Load its EMA weights from the teacher checkpoint before wrapping.
+        teacher = model
+        teacher_ckpt_dir = Path(config['training']['teacher_checkpoint_dir'])
+
+        teacher.ema_area.load_weights(
+            str(teacher_ckpt_dir / 'ema_area_model_best.weights.h5')
         )
+        for area_name in teacher.active_areas:
+            teacher.ema_voxels[area_name].load_weights(
+                str(teacher_ckpt_dir / f'ema_voxel_{area_name}_best.weights.h5')
+            )
+        print(f"✓ Teacher EMA weights loaded from {teacher_ckpt_dir}")
+
+        factor = config['training']['distillation_factor']
+        with strategy.scope():
+            model = scoreDiffusion_distill(teacher=teacher, factor=factor, config=config)
+        print(f"✓ Distillation model created (factor={factor}, "
+              f"steps: {teacher.num_steps} → {model.num_steps})")
     
     # === Optimizer ===
     if config['training']['use_cosine_decay']:
@@ -331,17 +348,23 @@ if __name__ == '__main__':
     # === Incremental Plotting ===
     if rank == 0 and config['training'].get('save_training_plots', False):
         class IncrementalPlotter(Callback):
-            def __init__(self, checkpoint_dir, plot_every=10, run_name="", model_config=None):
+            def __init__(self, checkpoint_dir, plot_every=10, run_name="",
+                         model_config=None, distillation_mode=False):
                 super().__init__()
-                self.checkpoint_dir = Path(checkpoint_dir)
-                self.plot_every = plot_every
-                self.run_name = run_name
-                self.model_config = model_config
-                
-                # Initialize history for all metrics
-                self.epoch_history = {'loss': [], 'val_loss': [], 'loss_area': [], 'val_loss_area': []}
-                
-                # Add voxel model histories dynamically
+                self.checkpoint_dir    = Path(checkpoint_dir)
+                self.plot_every        = plot_every
+                self.run_name          = run_name
+                self.model_config      = model_config
+                self.distillation_mode = distillation_mode
+
+                # Initialize history for all metrics.
+                # In distillation mode, loss_area is absent (ResNet not trained).
+                self.epoch_history = {'loss': [], 'val_loss': []}
+                if not distillation_mode:
+                    self.epoch_history['loss_area']     = []
+                    self.epoch_history['val_loss_area'] = []
+
+                # Add per-U-Net histories dynamically
                 for area_name in model_config['LAYER_NAMES']:
                     self.epoch_history[f'loss_{area_name}'] = []
                     self.epoch_history[f'val_loss_{area_name}'] = []
@@ -386,30 +409,61 @@ if __name__ == '__main__':
                 axes[0, 0].set_yscale('log')  # Total Loss logarithmic
                 axes[0, 0].set_xlabel('Epoch', fontsize=11)
                 axes[0, 0].set_ylabel('Total Loss', fontsize=11)
-                axes[0, 0].set_title('Total Loss (ResNet + U-Nets weighted)', fontweight='bold')
+                if self.distillation_mode:
+                    axes[0, 0].set_title('Total Loss (U-Nets weighted, no ResNet term)',
+                                         fontweight='bold')
+                else:
+                    axes[0, 0].set_title('Total Loss (ResNet + U-Nets weighted)',
+                                         fontweight='bold')
                 axes[0, 0].legend(fontsize=10)
                 axes[0, 0].grid(True, alpha=0.3)
-                
-                # ResNet Area Loss (top right)
-                axes[0, 1].plot(epochs, self.epoch_history['loss_area'], 
-                            label='Train', linewidth=2, marker='o', markersize=2,
-                            color='#2ca02c')  # Green
-                axes[0, 1].plot(epochs, self.epoch_history['val_loss_area'], 
-                            label='Val', linewidth=2, marker='s', markersize=2,
-                            color='#d62728')  # Red
-                axes[0, 1].set_yscale('log')  # ResNet Area Loss logarithmic
-                axes[0, 1].set_xlabel('Epoch', fontsize=11)
-                axes[0, 1].set_ylabel('Area Loss', fontsize=11)
-                axes[0, 1].set_title('ResNet: Area Hits (4D vector)', fontweight='bold')
-                axes[0, 1].legend(fontsize=10)
-                axes[0, 1].grid(True, alpha=0.3)
+
+                # Top-right: ResNet loss (normal) or distillation info panel
+                if self.distillation_mode:
+                    axes[0, 1].axis('off')
+                    factor = self.model_config.get('distillation_factor', '?')
+                    teacher_steps = self.model_config.get('num_steps', '?')
+                    student_steps = (teacher_steps // factor
+                                     if isinstance(teacher_steps, int) and isinstance(factor, int)
+                                     else '?')
+                    axes[0, 1].text(
+                        0.5, 0.5,
+                        f"ResNet: frozen teacher EMA\n(not distilled)\n\n"
+                        f"Factor:       {factor}×\n"
+                        f"Teacher steps: {teacher_steps}\n"
+                        f"Student steps: {student_steps}",
+                        ha='center', va='center', fontsize=12, family='monospace',
+                        transform=axes[0, 1].transAxes,
+                        bbox=dict(boxstyle='round', facecolor='#fff3cd',
+                                  edgecolor='gray', linewidth=1.5, alpha=0.9)
+                    )
+                else:
+                    axes[0, 1].plot(epochs, self.epoch_history['loss_area'],
+                                label='Train', linewidth=2, marker='o', markersize=2,
+                                color='#2ca02c')  # Green
+                    axes[0, 1].plot(epochs, self.epoch_history['val_loss_area'],
+                                label='Val', linewidth=2, marker='s', markersize=2,
+                                color='#d62728')  # Red
+                    axes[0, 1].set_yscale('log')
+                    axes[0, 1].set_xlabel('Epoch', fontsize=11)
+                    axes[0, 1].set_ylabel('Area Loss', fontsize=11)
+                    axes[0, 1].set_title('ResNet: Area Hits (4D vector)', fontweight='bold')
+                    axes[0, 1].legend(fontsize=10)
+                    axes[0, 1].grid(True, alpha=0.3)
                 
                 # Summary Statistics (bottom left)
                 axes[1, 0].axis('off')
                 best_epoch = int(np.argmin(self.epoch_history['val_loss']))
                 best_val_loss = self.epoch_history['val_loss'][best_epoch]
                 
-                summary_text = f"""Loss Composition:
+                if self.distillation_mode:
+                    summary_text = f"""Loss Composition (distillation):
+                Total = Σ(U-Net Losses × weights)
+                ResNet: frozen teacher EMA
+
+                Area Weights:"""
+                else:
+                    summary_text = f"""Loss Composition:
                 Total = ResNet Loss + Σ(U-Net Losses × weights)
 
                 Area Weights:"""
@@ -436,7 +490,15 @@ if __name__ == '__main__':
                 axes[1, 1].axis('off')
                 current_epoch = len(self.epoch_history['loss'])
                 
-                breakdown_text = f"""Current Loss Breakdown (Epoch {current_epoch}):
+                if self.distillation_mode:
+                    breakdown_text = f"""Current Loss Breakdown (Epoch {current_epoch}):
+
+                ResNet (Area):
+                frozen teacher EMA (not trained)
+
+                U-Nets (distilled):"""
+                else:
+                    breakdown_text = f"""Current Loss Breakdown (Epoch {current_epoch}):
 
                 ResNet (Area):
                 Train: {self.epoch_history['loss_area'][-1]:.4f}
@@ -511,26 +573,27 @@ if __name__ == '__main__':
                 plt.savefig(unets_path, dpi=150, bbox_inches='tight')
                 plt.close(fig_unets)
                 
-                # === 3. Individual Model Plots (unchanged) ===
-                # ResNet plot
-                fig_resnet, ax = plt.subplots(1, 1, figsize=(8, 6))
-                ax.plot(epochs, self.epoch_history['loss_area'], 
-                       label='Train', linewidth=2, marker='o', markersize=3,
-                       color='#2ca02c')
-                ax.plot(epochs, self.epoch_history['val_loss_area'],
-                       label='Val', linewidth=2, marker='s', markersize=3,
-                       color='#d62728')
-                ax.set_yscale('log')
-                ax.set_xlabel('Epoch', fontsize=12)
-                ax.set_ylabel('Loss', fontsize=12)
-                ax.set_title(f'ResNet: Area Hits - {self.run_name}{title_suffix}', 
-                           fontsize=13, fontweight='bold')
-                ax.legend(fontsize=11)
-                ax.grid(True, alpha=0.3)
-                plt.tight_layout()
-                resnet_path = self.checkpoint_dir / f'resnet{suffix}.png'
-                plt.savefig(resnet_path, dpi=150, bbox_inches='tight')
-                plt.close(fig_resnet)
+                # === 3. Individual Model Plots ===
+                # ResNet plot — skipped in distillation mode (ResNet frozen, not trained)
+                if not self.distillation_mode:
+                    fig_resnet, ax = plt.subplots(1, 1, figsize=(8, 6))
+                    ax.plot(epochs, self.epoch_history['loss_area'],
+                           label='Train', linewidth=2, marker='o', markersize=3,
+                           color='#2ca02c')
+                    ax.plot(epochs, self.epoch_history['val_loss_area'],
+                           label='Val', linewidth=2, marker='s', markersize=3,
+                           color='#d62728')
+                    ax.set_yscale('log')
+                    ax.set_xlabel('Epoch', fontsize=12)
+                    ax.set_ylabel('Loss', fontsize=12)
+                    ax.set_title(f'ResNet: Area Hits - {self.run_name}{title_suffix}',
+                               fontsize=13, fontweight='bold')
+                    ax.legend(fontsize=11)
+                    ax.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    resnet_path = self.checkpoint_dir / f'resnet{suffix}.png'
+                    plt.savefig(resnet_path, dpi=150, bbox_inches='tight')
+                    plt.close(fig_resnet)
                 
                 # U-Net individual plots
                 for idx, area_name in enumerate(self.model_config['LAYER_NAMES']):
@@ -557,15 +620,24 @@ if __name__ == '__main__':
                     plt.close(fig_unet)
                 
                 if not final:
-                    n_plots = 2 + 1 + len(self.model_config['LAYER_NAMES'])  # overview + unets + resnet + individual unets
-                    print(f"  → Saved {n_plots} plots (overview, unets, resnet, {len(self.model_config['LAYER_NAMES'])} individual)")
+                    n_individual = len(self.model_config['LAYER_NAMES'])
+                    if self.distillation_mode:
+                        n_plots = 2 + n_individual        # overview + unets + individual U-Nets
+                        print(f"  → Saved {n_plots} plots "
+                              f"(overview, unets, {n_individual} individual) "
+                              f"[distillation mode, no ResNet plot]")
+                    else:
+                        n_plots = 2 + 1 + n_individual    # overview + unets + resnet + individual U-Nets
+                        print(f"  → Saved {n_plots} plots "
+                              f"(overview, unets, resnet, {n_individual} individual)")
         
         plot_freq = config['training'].get('plot_update_frequency', 10)
         incremental_plotter = IncrementalPlotter(
             checkpoint_dir=str(checkpoint_folder),
             plot_every=plot_freq,
             run_name=config['training']['run_name'],
-            model_config=config
+            model_config=config,
+            distillation_mode=config['training']['enable_distillation'],
         )
         callbacks.append(incremental_plotter)
         print(f"✓ Incremental plotting enabled (every {plot_freq} epochs)")
