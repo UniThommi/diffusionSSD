@@ -8,6 +8,7 @@ __pycache__/
 *.json
 *.png
 *.md
+*.txt
 
 checkpoints_cpu/
 src/training_logs

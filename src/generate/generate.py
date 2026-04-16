@@ -1224,7 +1224,8 @@ def write_output_hdf5(
         mat_grp = f.create_group("mat_map")
         for name, mid in mat_map.items():
             if isinstance(mid, int):
-                mat_grp.create_dataset(name.encode() if isinstance(name, str) else name, data=mid)
+                ds_name = name if name else "noMaterial"
+                mat_grp.create_dataset(ds_name, data=mid)
 
         # Volume map
         with open(config["mapping"]["volume_mapping_file"], "r") as vf:
@@ -1232,7 +1233,8 @@ def write_output_hdf5(
         vol_grp = f.create_group("vol_map")
         for name, vid in vol_map.items():
             if isinstance(vid, int):
-                vol_grp.create_dataset(name.encode() if isinstance(name, str) else name, data=vid)
+                ds_name = name if name else "noVolume"
+                vol_grp.create_dataset(ds_name, data=vid)
 
         # Voxel geometry
         voxels_grp = f.create_group("voxels")
