@@ -1192,81 +1192,92 @@ def write_output_hdf5(
     )
 
     # --- Write ---
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    try:
+        with h5py.File(output_path, "w") as f:
 
-    with h5py.File(output_path, "w") as f:
+            # Event IDs
+            f.create_dataset("event_id_columns",
+                             data=np.array(event_id_columns, dtype=object))
+            f.create_dataset("event_ids", data=event_ids, dtype="int64")
 
-        # Event IDs
-        f.create_dataset("event_id_columns",
-                         data=np.array(event_id_columns, dtype=object))
-        f.create_dataset("event_ids", data=event_ids, dtype="int64")
+            # Phi
+            f.create_dataset("phi_columns", data=np.array(phi_order, dtype=object))
+            f.create_dataset("phi_matrix", data=phi_matrix, dtype="float32")
 
-        # Phi
-        f.create_dataset("phi_columns", data=np.array(phi_order, dtype=object))
-        f.create_dataset("phi_matrix", data=phi_matrix, dtype="float32")
+            # Target
+            f.create_dataset("target_columns", data=np.array(voxel_keys, dtype=object))
+            f.create_dataset("target_matrix", data=target_matrix, dtype="int32")
 
-        # Target
-        f.create_dataset("target_columns", data=np.array(voxel_keys, dtype=object))
-        f.create_dataset("target_matrix", data=target_matrix, dtype="int32")
+            # Regions (cross-check pair)
+            f.create_dataset("region_columns", data=np.array(region_names, dtype=object))
+            f.create_dataset("region_matrix", data=region_matrix_from_voxels, dtype="int32")
+            f.create_dataset("region_matrix_resnet",
+                             data=region_matrix_from_resnet, dtype="int32")
 
-        # Regions (cross-check pair)
-        f.create_dataset("region_columns", data=np.array(region_names, dtype=object))
-        f.create_dataset("region_matrix", data=region_matrix_from_voxels, dtype="int32")
-        f.create_dataset("region_matrix_resnet",
-                         data=region_matrix_from_resnet, dtype="int32")
+            # Primaries
+            f.create_dataset("primaries", data=n_events)
 
-        # Primaries
-        f.create_dataset("primaries", data=n_events)
+            # Material map
+            with open(config["mapping"]["material_mapping_file"], "r") as mf:
+                mat_map = json.load(mf)
+            mat_grp = f.create_group("mat_map")
+            for name, mid in mat_map.items():
+                if isinstance(mid, int):
+                    ds_name = name if name else "noMaterial"
+                    mat_grp.create_dataset(ds_name, data=mid)
 
-        # Material map
-        with open(config["mapping"]["material_mapping_file"], "r") as mf:
-            mat_map = json.load(mf)
-        mat_grp = f.create_group("mat_map")
-        for name, mid in mat_map.items():
-            if isinstance(mid, int):
-                ds_name = name if name else "noMaterial"
-                mat_grp.create_dataset(ds_name, data=mid)
+            # Volume map
+            with open(config["mapping"]["volume_mapping_file"], "r") as vf:
+                vol_map = json.load(vf)
+            vol_grp = f.create_group("vol_map")
+            for name, vid in vol_map.items():
+                if isinstance(vid, int):
+                    ds_name = name if name else "noVolume"
+                    vol_grp.create_dataset(ds_name, data=vid)
 
-        # Volume map
-        with open(config["mapping"]["volume_mapping_file"], "r") as vf:
-            vol_map = json.load(vf)
-        vol_grp = f.create_group("vol_map")
-        for name, vid in vol_map.items():
-            if isinstance(vid, int):
-                ds_name = name if name else "noVolume"
-                vol_grp.create_dataset(ds_name, data=vid)
+            # Voxel geometry
+            voxels_grp = f.create_group("voxels")
+            for voxel in voxels_json:
+                idx = voxel["index"]
+                v_grp = voxels_grp.create_group(idx)
+                v_grp.create_dataset(
+                    "center", data=np.array(voxel["center"], dtype=np.float32))
+                corners_grp = v_grp.create_group("corners")
+                corners = np.array(voxel["corners"])
+                corners_grp.create_dataset("x", data=corners[:, 0])
+                corners_grp.create_dataset("y", data=corners[:, 1])
+                corners_grp.create_dataset("z", data=corners[:, 2])
+                v_grp.create_dataset("layer", data=voxel["layer"])
 
-        # Voxel geometry
-        voxels_grp = f.create_group("voxels")
-        for voxel in voxels_json:
-            idx = voxel["index"]
-            v_grp = voxels_grp.create_group(idx)
-            v_grp.create_dataset(
-                "center", data=np.array(voxel["center"], dtype=np.float32))
-            corners_grp = v_grp.create_group("corners")
-            corners = np.array(voxel["corners"])
-            corners_grp.create_dataset("x", data=corners[:, 0])
-            corners_grp.create_dataset("y", data=corners[:, 1])
-            corners_grp.create_dataset("z", data=corners[:, 2])
-            v_grp.create_dataset("layer", data=voxel["layer"])
+        file_size_mb = os.path.getsize(output_path) / 1e6
+        print(f"\n✓ Output written: {output_path}")
+        print(f"  Events:        {n_events:,}")
+        print(f"  phi_matrix:    {phi_matrix.shape} float32")
+        print(f"  target_matrix: {target_matrix.shape} int32")
+        print(f"  region_matrix: {region_matrix_from_voxels.shape} int32")
+        print(f"  Voxels:        {len(voxel_keys)}")
+        print(f"  Size:          {file_size_mb:.1f} MB")
 
-    file_size_mb = os.path.getsize(output_path) / 1e6
-    print(f"\n✓ Output written: {output_path}")
-    print(f"  Events:        {n_events:,}")
-    print(f"  phi_matrix:    {phi_matrix.shape} float32")
-    print(f"  target_matrix: {target_matrix.shape} int32")
-    print(f"  region_matrix: {region_matrix_from_voxels.shape} int32")
-    print(f"  Voxels:        {len(voxel_keys)}")
-    print(f"  Size:          {file_size_mb:.1f} MB")
+        # Cross-check: region sums
+        diff = np.abs(region_matrix_from_voxels - region_matrix_from_resnet)
+        print(f"\n  Region cross-check (voxel_sum vs resnet):")
+        for idx, name in enumerate(region_names):
+            mean_diff = np.mean(diff[:, idx])
+            max_diff = np.max(diff[:, idx])
+            print(f"    {name:>5s}: mean_abs_diff={mean_diff:.2f}, "
+                  f"max_abs_diff={max_diff:.0f}")
 
-    # Cross-check: region sums
-    diff = np.abs(region_matrix_from_voxels - region_matrix_from_resnet)
-    print(f"\n  Region cross-check (voxel_sum vs resnet):")
-    for idx, name in enumerate(region_names):
-        mean_diff = np.mean(diff[:, idx])
-        max_diff = np.max(diff[:, idx])
-        print(f"    {name:>5s}: mean_abs_diff={mean_diff:.2f}, "
-              f"max_abs_diff={max_diff:.0f}")
+    except Exception as e:
+        # Remove the partial file so it cannot be mistaken for a valid output
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+                print(f"\nERROR: Write failed — partial file '{output_path}' removed.",
+                      file=sys.stderr)
+            except OSError:
+                print(f"\nERROR: Write failed and partial file '{output_path}' "
+                      f"could not be removed.", file=sys.stderr)
+        raise
 
 
 # =============================================================================
@@ -1291,6 +1302,18 @@ def main():
         print(f"  Random seed: {args.seed}")
     else:
         print(f"  Random seed: None (non-deterministic)")
+
+    # --- Validate output path before any expensive work ---
+    out_parent = os.path.dirname(os.path.abspath(args.output_file)) or "."
+    os.makedirs(out_parent, exist_ok=True)
+    try:
+        with open(args.output_file, "wb"):
+            pass
+        os.remove(args.output_file)
+        print(f"  Output path OK: {args.output_file}")
+    except OSError as e:
+        print(f"ERROR: Cannot write output file '{args.output_file}': {e}", file=sys.stderr)
+        sys.exit(1)
 
     # --- Hardware ---
     if args.device == "cpu":
