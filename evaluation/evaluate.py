@@ -213,7 +213,7 @@ def build_region_masks(target_columns: list) -> Dict[str, np.ndarray]:
 
 def pair_events(sim: dict, gen: dict) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Match simulation events to generated events by (run_id, nc_id).
+    Match simulation events to generated events by (run_id, muon_id, nc_id).
 
     Both files must contain event_ids / event_id_columns datasets written by
     generate.py.  Raises RuntimeError if either file is missing them.
@@ -242,20 +242,21 @@ def pair_events(sim: dict, gen: dict) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _pair_by_ids(sim: dict, gen: dict) -> Tuple[np.ndarray, np.ndarray]:
-    """Match events by (run_id, nc_id) tuple."""
+    """Match events by (run_id, muon_id, nc_id) triple."""
     def _key_cols(ids, cols):
-        run_idx = cols.index("run_id")
-        nc_idx  = cols.index("nc_id")
-        return ids[:, run_idx], ids[:, nc_idx]
+        run_idx  = cols.index("run_id")
+        muon_idx = cols.index("muon_id")
+        nc_idx   = cols.index("nc_id")
+        return ids[:, run_idx], ids[:, muon_idx], ids[:, nc_idx]
 
-    sim_run, sim_nc = _key_cols(sim["event_ids"], sim["event_id_columns"])
-    gen_run, gen_nc = _key_cols(gen["event_ids"], gen["event_id_columns"])
+    sim_run, sim_muon, sim_nc = _key_cols(sim["event_ids"], sim["event_id_columns"])
+    gen_run, gen_muon, gen_nc = _key_cols(gen["event_ids"], gen["event_id_columns"])
 
-    # Build lookup: (run_id, nc_id) → sim row index (-1 marks collision)
+    # Build lookup: (run_id, muon_id, nc_id) → sim row index (-1 marks collision)
     sim_lookup: dict = {}
     n_collisions = 0
     for i in range(len(sim_run)):
-        key = (int(sim_run[i]), int(sim_nc[i]))
+        key = (int(sim_run[i]), int(sim_muon[i]), int(sim_nc[i]))
         if key in sim_lookup:
             sim_lookup[key] = -1
             n_collisions += 1
@@ -264,13 +265,13 @@ def _pair_by_ids(sim: dict, gen: dict) -> Tuple[np.ndarray, np.ndarray]:
 
     if n_collisions > 0:
         pct = n_collisions / len(sim_run) * 100
-        print(f"  WARNING: {n_collisions} duplicate (run_id, nc_id) pairs in sim "
+        print(f"  WARNING: {n_collisions} duplicate (run_id, muon_id, nc_id) triples in sim "
               f"({pct:.2f}%) — ambiguous matches excluded.")
 
     sim_indices, gen_indices = [], []
     n_unmatched = 0
     for j in range(len(gen_run)):
-        key = (int(gen_run[j]), int(gen_nc[j]))
+        key = (int(gen_run[j]), int(gen_muon[j]), int(gen_nc[j]))
         s = sim_lookup.get(key, None)
         if s is not None and s != -1:
             sim_indices.append(s)
